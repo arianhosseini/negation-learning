@@ -19,6 +19,8 @@ from transformers import WEIGHTS_NAME, CONFIG_NAME
 from transformers.modeling_bert import BertForPreTraining, BertConfig, BertForNegPreTraining
 from transformers.tokenization_bert import BertTokenizer
 from transformers.optimization import AdamW, WarmupLinearSchedule
+import dist_comms
+
 
 InputFeatures = namedtuple("InputFeatures", "input_ids input_mask segment_ids lm_label_ids")
 
@@ -71,9 +73,13 @@ def fix_bn(m):
         m.eval().half()
 
 class FuckWrapper(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, args):
         super().__init__()
-        self.core = nn.DataParallel(BertForNegPreTraining.from_pretrained('bert-base-cased'))
+        model = BertForNegPreTraining.from_pretrained('bert-base-cased')
+        model = model.to(device)
+
+        self.core = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        # self.core = nn.DataParallel(BertForNegPreTraining.from_pretrained('bert-base-cased'))
     def forward(self, **input):
         return self.core(**input)
     def save_pretrained(self, output_dir):
@@ -164,6 +170,9 @@ def main():
                         type=int,
                         default=-1,
                         help="local_rank for distributed training on gpus")
+    parser.add_argument("--port_idx",
+                        type=int)
+
     parser.add_argument("--no_cuda",
                         action='store_true',
                         help="Whether not to use CUDA when available")
@@ -180,7 +189,7 @@ def main():
                         type=int,
                         help="Total batch size for training.")
     parser.add_argument("--kr_freq",
-                        default=0.7,
+                        default=0.98,
                         type=float)
     parser.add_argument('--fp16',
                         action='store_true',
@@ -204,7 +213,7 @@ def main():
                         type=float,
                         help="Epsilon for Adam optimizer.")
     parser.add_argument("--learning_rate",
-                        default=1e-4,
+                        default=1e-5,
                         type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument('--seed',
@@ -213,6 +222,10 @@ def main():
                         help="random seed for initialization")
 
     args = parser.parse_args()
+
+
+
+
 
     assert args.pregenerated_data.is_dir(), \
         "--pregenerated_data should point to the folder of files made by pregenerate_training_data.py!"
@@ -247,6 +260,7 @@ def main():
         device = torch.device("cuda", args.local_rank)
         print("GPU Device: ", device)
         n_gpu = 1
+        dist_comms.init_distributed_training(args.local_rank, args.port_idx)
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
     logging.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
         device, n_gpu, bool(args.local_rank != -1), args.fp16))
@@ -285,12 +299,11 @@ def main():
 
     # Prepare model
     config = BertConfig.from_pretrained(args.bert_model)
-    # config.num_hidden_layers = args.num_layers
-    model = FuckWrapper(config)
-    model.to(device)
+    core_model = BertForNegPreTraining.from_pretrained('bert-base-cased')
+    core_model = core_model.to(device)
 
     # Prepare optimizer
-    param_optimizer = list(model.named_parameters())
+    param_optimizer = list(core_model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
@@ -305,7 +318,9 @@ def main():
             from apex import amp
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+        core_model, optimizer = amp.initialize(core_model, optimizer, opt_level=args.fp16_opt_level)
+
+    model = torch.nn.parallel.DistributedDataParallel(core_model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
 
     global_step = 0
     logging.info("***** Running training *****")
@@ -314,12 +329,13 @@ def main():
     logging.info("  Num steps = %d", num_train_optimization_steps)
     model.train()
 
+    if args.local_rank == 0 or args.local_rank == -1:
+        before_train_path = Path(os.path.join(args.output_dir,"before_training"))
+        print("Before training path: ", before_train_path)
+        before_train_path.mkdir(parents=True, exist_ok=True)
+        model.module.save_pretrained(os.path.join(args.output_dir,"before_training"))
 
-    before_train_path = Path(os.path.join(args.output_dir,"before_training"))
-    print("Before training path: ", before_train_path)
-    before_train_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(os.path.join(args.output_dir,"before_training"))
-    tokenizer.save_pretrained(os.path.join(args.output_dir, "before_training"))
+        tokenizer.save_pretrained(os.path.join(args.output_dir, "before_training"))
 
     neg_epoch_dataset = PregeneratedDataset(epoch=0, training_path=args.pregenerated_neg_data, tokenizer=tokenizer,
                                         num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
@@ -349,9 +365,9 @@ def main():
         tr_loss = 0
         nb_tr_examples, nb_tr_steps = 0, 0
 
-        if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1):
+        if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
             logging.info("** ** * Saving fine-tuned model ** ** * ")
-            model.save_pretrained(args.output_dir)
+            model.module.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
 
         with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch}") as pbar:
@@ -360,7 +376,7 @@ def main():
 
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, lm_label_ids = batch
-
+                
                 outputs = model(input_ids=input_ids,
                                 attention_mask=input_mask,
                                 token_type_ids=segment_ids,
@@ -420,7 +436,7 @@ def main():
 
                     tr_loss += loss.item()
                     nb_tr_examples += input_ids.size(0)
-                    if args.local_rank == -1:
+                    if args.local_rank == 0 or args.local_rank == -1:
                         nb_tr_steps += 1
                         mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
                         pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
@@ -433,9 +449,9 @@ def main():
 
 
     # Save a trained model
-    if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1):
+    if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
         logging.info("** ** * Saving fine-tuned model ** ** * ")
-        model.save_pretrained(args.output_dir)
+        model.module.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
 
 
