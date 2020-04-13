@@ -1,0 +1,24 @@
+1	The	the	DET	DT	Definite=Def|PronType=Art	3	det	_	start_char=3288|end_char=3291
+2	other	other	ADJ	JJ	Degree=Pos	3	amod	_	start_char=3292|end_char=3297
+3	men	man	NOUN	NNS	Number=Plur	4	nsubj	_	start_char=3298|end_char=3301
+4	shuffled	shuffle	VERB	VBD	Mood=Ind|Tense=Past|VerbForm=Fin	0	root	_	start_char=3302|end_char=3310
+5	.	.	PUNCT	.	_	4	punct	_	start_char=3310|end_char=3311
+
+1	He	he	PRON	PRP	Case=Nom|Gender=Masc|Number=Sing|Person=3|PronType=Prs	2	nsubj	_	start_char=3698|end_char=3700
+2	returned	return	VERB	VBD	Mood=Ind|Tense=Past|VerbForm=Fin	0	root	_	start_char=3701|end_char=3709
+3	slowly	slowly	ADV	RB	_	2	advmod	_	start_char=3710|end_char=3716
+4	to	to	ADP	IN	_	6	case	_	start_char=3717|end_char=3719
+5	the	the	DET	DT	Definite=Def|PronType=Art	6	det	_	start_char=3720|end_char=3723
+6	bunkhouse	bunkhouse	NOUN	NN	Number=Sing	2	obl	_	start_char=3724|end_char=3733
+7	.	.	PUNCT	.	_	2	punct	_	start_char=3733|end_char=3734
+
+1	Japan	Japan	PROPN	NNP	Number=Sing	4	nmod:poss	_	start_char=7327|end_char=7332
+2	's	's	PART	POS	_	1	case	_	start_char=7332|end_char=7334
+3	new	new	ADJ	JJ	Degree=Pos	4	amod	_	start_char=7335|end_char=7338
+4	rulers	ruler	NOUN	NNS	Number=Plur	6	nsubj	_	start_char=7339|end_char=7345
+5	were	be	AUX	VBD	Mood=Ind|Tense=Past|VerbForm=Fin	6	aux	_	start_char=7346|end_char=7350
+6	catching	catch	VERB	VBG	Tense=Pres|VerbForm=Part	0	root	_	start_char=7351|end_char=7359
+7	on	on	ADV	RB	_	6	advmod	_	start_char=7360|end_char=7362
+8	quickly	quickly	ADV	RB	_	6	advmod	_	start_char=7363|end_char=7370
+9	.	.	PUNCT	.	_	6	punct	_	start_char=7370|end_char=7371
+
