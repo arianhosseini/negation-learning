@@ -1,0 +1,22 @@
+1	Anarchism	anarchism	NOUN	NN	Number=Sing	4	nsubj:pass	_	start_char=0|end_char=9
+2	is	be	AUX	VBZ	Mood=Ind|Number=Sing|Person=3|Tense=Pres|VerbForm=Fin	4	aux:pass	_	start_char=10|end_char=12
+3	often	often	ADV	RB	_	4	advmod	_	start_char=13|end_char=18
+4	defined	define	VERB	VBN	Tense=Past|VerbForm=Part|Voice=Pass	0	root	_	start_char=19|end_char=26
+5	as	as	ADP	IN	_	8	case	_	start_char=27|end_char=29
+6	a	a	DET	DT	Definite=Ind|PronType=Art	8	det	_	start_char=30|end_char=31
+7	political	political	ADJ	JJ	Degree=Pos	8	amod	_	start_char=32|end_char=41
+8	philosophy	philosophy	NOUN	NN	Number=Sing	4	obl	_	start_char=42|end_char=52
+9	which	which	PRON	WDT	PronType=Rel	10	nsubj	_	start_char=53|end_char=58
+10	holds	hold	VERB	VBZ	Mood=Ind|Number=Sing|Person=3|Tense=Pres|VerbForm=Fin	8	acl:relcl	_	start_char=59|end_char=64
+11	the	the	DET	DT	Definite=Def|PronType=Art	12	det	_	start_char=65|end_char=68
+12	state	state	NOUN	NN	Number=Sing	10	obj	_	start_char=69|end_char=74
+13	to	to	PART	TO	_	15	mark	_	start_char=75|end_char=77
+14	be	be	AUX	VB	VerbForm=Inf	15	cop	_	start_char=78|end_char=80
+15	undesirable	undesirable	ADJ	JJ	Degree=Pos	10	xcomp	_	start_char=81|end_char=92
+16	,	,	PUNCT	,	_	17	punct	_	start_char=93|end_char=94
+17	unnecessary	unnecessary	ADJ	JJ	Degree=Pos	15	conj	_	start_char=95|end_char=106
+18	,	,	PUNCT	,	_	20	punct	_	start_char=107|end_char=108
+19	or	or	CCONJ	CC	_	20	cc	_	start_char=109|end_char=111
+20	harmful	harmful	ADJ	JJ	Degree=Pos	15	conj	_	start_char=112|end_char=119
+21	.	.	PUNCT	.	_	4	punct	_	start_char=120|end_char=121
+
