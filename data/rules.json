@@ -1,0 +1,421 @@
+[
+  {
+    "name": "negation with ca n't",
+    "pattern": "{$;tag:/VB.*/}=A >/advmod/ {tag:RB;word:/n’t|n't/;lemma:not}=notword >/aux.*/ ({lemma:can;word:ca}=canaux $++ {tag:RB;word:/n’t|n't/;lemma:not}=notword) ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "ex": "you can't do anything about it",
+
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "can",
+        "to_replace": "canaux"
+      },
+      {
+        "type": "replace",
+        "token": "",
+        "to_replace": "notword"
+      }
+    ]
+  },
+  {
+    "name": "negation with not",
+    "ex": "you can not do anything about it",
+    "pattern": "{$;tag:/VB.*/}=A >/advmod/ {tag:RB;word:/not|n’t|n't/;lemma:not}=notword ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "",
+        "to_replace": "notword"
+      }
+    ]
+  },
+  {
+    "name": "aux before subj",
+    "ex": "nowhere in his confession did he mention blah",
+    "pattern": "{$;tag:/VB.*/}=A >/advmod|cc/ {word:/never|nobody|no|nothing|nowhere|neither|Never|Nobody|No|Nothing|Nowhere|Neither/}=npiword >/aux.*/ ({}=B $++ {}=subject) >/nsubj.*/ {}=subject ?>obj {tag:/NN.*/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "move",
+        "to_move": "B",
+        "anchor": "A",
+        "position": "before"
+      },
+      {
+        "type": "replace",
+        "token": "",
+        "to_replace": "npiword"
+      }
+    ]
+  },
+  {
+    "name": "Det NPI (neither, no, ...) for plural NN (subj or obj)",
+    "ex": "neither test subjects could survive. / I liked neither instruments",
+    "pattern": "{$;tag:/VB.*/}=A >/nsubj.*|obj.*/ ({tag:/NN.*/;cpos:/.*Number=Plur.*/}=object >det {word:/|no|neither|No|Neither/}=npiword)",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "some",
+        "to_replace": "npiword"
+      }
+    ]
+  },
+  {
+    "name": "Det NPI (neither, no, ...) for singular NN (subj or obj)",
+    "ex": "neither test subjects could survive. / I liked neither instruments",
+    "pattern": "{$;tag:/VB.*/}=A >/nsubj.*|obj.*/ ({tag:/NN.*/;cpos:/.*Number=Sing.*/}=object >det {word:/|no|neither|No|Neither/}=npiword)",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "the",
+        "to_replace": "npiword"
+      }
+    ]
+  },
+  {
+    "name": "NPI never again",
+    "ex": "the two never again saw each other",
+    "pattern": "{$;tag:/VB.*/}=A >/advmod/ {tag:/RB.*/;word:/never|Never/}=npiword >/advmod/ {tag:/RB.*/;word:/again|Again/}=again ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "often",
+        "to_replace": "npiword"
+      },
+      {
+        "type": "replace",
+        "token": "",
+        "to_replace": "again"
+      }
+
+    ]
+  },
+  {
+    "name": "NPI never",
+    "ex": "the two never saw each other again",
+    "pattern": "{$;tag:/VB.*/}=A >/advmod/ {tag:/RB.*/;word:/never|Never/}=npiword ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "often",
+        "to_replace": "npiword"
+      }
+    ]
+  },
+  {
+    "name": "NPI nobody",
+    "ex": "nobody likes negation",
+    "pattern": "{$;tag:/VB.*/}=A >/nsubj.*|obj.*/ {tag:/NN.*/;word:/nobody|Nobody/}=npiword ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "somebody",
+        "to_replace": "npiword"
+      }
+    ]
+  },
+  {
+    "name": "NPI nothing as obj or subj",
+    "ex": "nothing ends that way",
+    "pattern": "{$;tag:/VB.*/}=A >/nsubj.*|obj.*/ {tag:/NN.*/;word:/nothing|Nothing/}=npiword ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "something",
+        "to_replace": "npiword"
+      }
+    ]
+  },
+  {
+    "name": "NPI nowhere as RB",
+    "ex": "He was nowhere in sight/ he had nowhere to go",
+    "pattern": "{tag:/RB.*/;word:/nowhere|Nowhere/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "somewhere",
+        "to_replace": "object"
+      }
+    ]
+  },
+  {
+    "name": "copula statements",
+    "pattern": "{$;tag:/NN.*|JJ.*/}=object >cop {tag:/VB.*/}=B",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "B",
+        "position": "after"
+      }
+    ]
+  },
+  {
+    "name": "double aux with can",
+    "Ex": "The second reaction can be described using either theory .",
+    "pattern": "{$;tag:VBN}=A  >/aux.*/ ({tag:MD;word:can}=B $+ {tag:VB}=C) >/aux.*/ {tag:VB}=C ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "cannot",
+        "to_replace": "B",
+      }
+    ]
+  },
+  {
+    "name": "double aux",
+    "Ex": "The second reaction can be described using either theory .",
+    "pattern": "{$;tag:VBN}=A  >/aux.*/ ({tag:MD}=B $+ {tag:VB}=C) >/aux.*/ {tag:VB}=C ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "C",
+        "position": "before"
+      }
+    ]
+  },
+  {
+    "name": "present continuous",
+    "Ex": "Russia is building two submarines.",
+    "pattern": "{$;tag:VBG;cpos:/.*Tense=Pres.*/}=A >/aux.*/=E {tag:/VB.*/;cpos:/.*Tense=Pres.*/}=B ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "B",
+        "position": "after"
+      }
+    ]
+  },
+  {
+    "name": "simple aux",
+    "pattern": "{$;cpos:/.*VerbForm=Inf.*/}=A >/aux.*/=E {tag:/VB.*/}=B ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "B",
+        "position": "after"
+      }
+    ]
+  },
+  {
+    "name": "Imperative",
+    "pattern": "{$;cpos:/.*Mood=Imp.*/}=A ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "do",
+        "rel": "AUX",
+        "anchor": "A",
+        "position": "before"
+      },
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "before"
+      }
+    ]
+  },
+  {
+    "name": "aux present",
+    "pattern": "{$;cpos:/.*Tense=Past.*/}=A >/aux.*/=E {cpos:/.*Tense=Pres.*/}=B ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "before"
+      }
+    ]
+  },
+  {
+    "name": "past perfect",
+    "pattern": "{$;cpos:/.*Tense=Past.*/}=A >/aux.*/=E {cpos:/.*Tense=Past.*/}=B ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "before"
+      }
+    ]
+  },
+  {
+    "name": "aux past",
+    "pattern": "{$;cpos:/.*Tense=Pres.*/}=A >/aux.*/=E {cpos:/.*Tense=Past.*/}=B ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "before"
+      }
+    ]
+  },
+  {
+    "name": "simple past with to be",
+    "pattern": "{$;cpos:/.*Tense=Past.*/;lemma:be}=A >nsubj=E {}=subject ?>obj {tag:/NN.*/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "after"
+      },
+    ]
+  },
+  {
+    "name": "simple past",
+    "pattern": "{$;cpos:/.*Tense=Past.*/}=A >/nsubj|csubj/=E {}=subject ?>obj {tag:/NN.*/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "did",
+        "rel": "AUX",
+        "anchor": "A",
+        "position": "before"
+      },
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "before"
+      },
+      {
+        "type": "lemmatize"
+      }
+    ]
+  },
+  {
+    "name": "simple present non 3rd to be ",
+    "pattern": "{$;tag:VBP;cpos:/.*Tense=Pres.*/;lemma:be}=A >/.*subj.*/=E {}=subject ?>obj {tag:/NN.*/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "after"
+      }
+    ]
+  },
+  {
+    "name": "simple present non 3rd",
+    "pattern": "{$;tag:/VBP|VB/;cpos:/.*Tense=Pres.*/}=A >/.*subj.*/=E {}=subject ?>obj {tag:/NN.*/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "do",
+        "rel": "AUX",
+        "anchor": "A",
+        "position": "before"
+      },
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "before"
+      }
+    ]
+  },
+  {
+    "name": "simple present single 3rd to be",
+    "pattern": "{$;tag:VBZ;cpos:/.*Tense=Pres.*/;lemma:be}=A >/.*subj.*|.*expl.*/=E {}=subject ?>obj {tag:/NN.*/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "after"
+      },
+    ]
+  },
+  {
+    "name": "simple present single 3rd",
+    "pattern": "{$;tag:VBZ;cpos:/.*Tense=Pres.*/}=A >/.*subj.*|.*expl.*/=E {}=subject ?>obj {tag:/NN.*/}=object",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "does",
+        "rel": "AUX",
+        "anchor": "A",
+        "position": "before"
+      },
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "A",
+        "position": "before"
+      },
+      {
+        "type": "lemmatize"
+      }
+    ]
+  },
+  {
+    "name": "can modal simple present",
+    "pattern": "{$;cpos:/.*.*/}=A >/aux.*/=E {tag:MD;word:can}=canword ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "replace",
+        "token": "cannot",
+        "to_replace": "canword"
+      }
+    ]
+  },
+  {
+    "name": "may would should simple present",
+    "pattern": "{$;cpos:/.*.*/}=A >/aux.*/=E {tag:MD}=B ?>obj {tag:/NN.*/}=object ?>/nsubj|csubj/ {tag:/NN.*/}=subject",
+    "priority": 1,
+    "actions": [
+      {
+        "type": "insert",
+        "token": "not",
+        "rel": "ADV",
+        "anchor": "B",
+        "position": "after"
+      }
+    ]
+  }
+]
