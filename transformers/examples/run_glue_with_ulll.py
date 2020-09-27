@@ -21,6 +21,7 @@ import argparse
 import glob
 import logging
 import os
+import json
 import random
 from pathlib import Path
 
@@ -36,9 +37,12 @@ except:
     from tensorboardX import SummaryWriter
 
 from tqdm import tqdm, trange
+from collections import namedtuple
+from torch.utils.data import DataLoader, Dataset, RandomSampler, TensorDataset
 
 from transformers import (WEIGHTS_NAME, BertConfig,
                                   BertForSequenceClassification, BertTokenizer,
+                                  BertForNegSequenceClassification,
                                   RobertaConfig,
                                   RobertaForSequenceClassification,
                                   RobertaTokenizer,
@@ -63,13 +67,107 @@ ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (
                                                                                 RobertaConfig, DistilBertConfig)), ())
 
 MODEL_CLASSES = {
-    'bert': (BertConfig, BertForSequenceClassification, BertTokenizer),
+    'bert': (BertConfig, BertForNegSequenceClassification, BertTokenizer),
     'xlnet': (XLNetConfig, XLNetForSequenceClassification, XLNetTokenizer),
     'xlm': (XLMConfig, XLMForSequenceClassification, XLMTokenizer),
     'roberta': (RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer),
     'distilbert': (DistilBertConfig, DistilBertForSequenceClassification, DistilBertTokenizer)
 }
 
+InputFeatures = namedtuple("InputFeatures", "input_ids input_mask segment_ids lm_label_ids")
+
+def convert_example_to_features(example, tokenizer, max_seq_length):
+    tokens = example["tokens"]
+    segment_ids = example["segment_ids"]
+    # is_random_next = example["is_random_next"]
+    masked_lm_positions = example["masked_lm_positions"]
+    masked_lm_labels = example["masked_lm_labels"]
+
+    assert len(tokens) == len(segment_ids) <= max_seq_length  # The preprocessed data should be already truncated
+    input_ids = tokenizer.convert_tokens_to_ids(tokens)
+    masked_label_ids = tokenizer.convert_tokens_to_ids(masked_lm_labels)
+
+    input_array = np.zeros(max_seq_length, dtype=np.int)
+    input_array[:len(input_ids)] = input_ids
+
+    mask_array = np.zeros(max_seq_length, dtype=np.bool)
+    mask_array[:len(input_ids)] = 1
+
+    segment_array = np.zeros(max_seq_length, dtype=np.bool)
+    segment_array[:len(segment_ids)] = segment_ids
+
+    lm_label_array = np.full(max_seq_length, dtype=np.int, fill_value=-1)
+    lm_label_array[masked_lm_positions] = masked_label_ids
+
+    features = InputFeatures(input_ids=input_array,
+                             input_mask=mask_array,
+                             segment_ids=segment_array,
+                             lm_label_ids=lm_label_array)
+    return features
+
+class PregeneratedDataset(Dataset):
+    def __init__(self, training_path, epoch, tokenizer, num_data_epochs, reduce_memory=False):
+        self.vocab = tokenizer.vocab
+        self.tokenizer = tokenizer
+        self.epoch = epoch
+        self.data_epoch = epoch % num_data_epochs
+        data_file = training_path / f"epoch_{self.data_epoch}.json"
+        metrics_file = training_path / f"epoch_{self.data_epoch}_metrics.json"
+        assert data_file.is_file() and metrics_file.is_file()
+        metrics = json.loads(metrics_file.read_text())
+        num_samples = metrics['num_training_examples']
+        seq_len = metrics['max_seq_len']
+        self.temp_dir = None
+        self.working_dir = None
+        if reduce_memory:
+            self.temp_dir = TemporaryDirectory()
+            self.working_dir = Path(self.temp_dir.name)
+            input_ids = np.memmap(filename=self.working_dir/'input_ids.memmap',
+                                  mode='w+', dtype=np.int32, shape=(num_samples, seq_len))
+            input_masks = np.memmap(filename=self.working_dir/'input_masks.memmap',
+                                    shape=(num_samples, seq_len), mode='w+', dtype=np.bool)
+            segment_ids = np.memmap(filename=self.working_dir/'segment_ids.memmap',
+                                    shape=(num_samples, seq_len), mode='w+', dtype=np.bool)
+            lm_label_ids = np.memmap(filename=self.working_dir/'lm_label_ids.memmap',
+                                     shape=(num_samples, seq_len), mode='w+', dtype=np.int32)
+            lm_label_ids[:] = -1
+        else:
+            input_ids = np.zeros(shape=(num_samples, seq_len), dtype=np.int32)
+            input_masks = np.zeros(shape=(num_samples, seq_len), dtype=np.bool)
+            segment_ids = np.zeros(shape=(num_samples, seq_len), dtype=np.bool)
+            lm_label_ids = np.full(shape=(num_samples, seq_len), dtype=np.int32, fill_value=-1)
+            # is_nexts = np.zeros(shape=(num_samples,), dtype=np.bool)
+        logging.info(f"Loading training examples for epoch {epoch}")
+        with data_file.open() as f:
+            for i, line in enumerate(tqdm(f, total=num_samples, desc="Training examples")):
+                line = line.strip()
+                example = json.loads(line)
+                features = convert_example_to_features(example, tokenizer, seq_len)
+                input_ids[i] = features.input_ids
+                segment_ids[i] = features.segment_ids
+                input_masks[i] = features.input_mask
+                lm_label_ids[i] = features.lm_label_ids
+                # is_nexts[i] = features.is_next
+        assert i == num_samples - 1  # Assert that the sample count metric was true
+        logging.info("Loading complete!")
+        self.num_samples = num_samples
+        self.seq_len = seq_len
+        self.input_ids = input_ids
+        self.input_masks = input_masks
+        self.segment_ids = segment_ids
+        self.lm_label_ids = lm_label_ids
+        # self.is_nexts = is_nexts
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, item):
+        return (torch.tensor(self.input_ids[item].astype(np.int64)),
+                torch.tensor(self.input_masks[item].astype(np.int64)),
+                torch.tensor(self.segment_ids[item].astype(np.int64)),
+                torch.tensor(self.lm_label_ids[item].astype(np.int64)),
+                # torch.tensor(self.is_nexts[item].astype(np.int64))
+                )
 
 def set_seed(args):
     random.seed(args.seed)
@@ -81,10 +179,43 @@ def set_seed(args):
 
 def train(args, train_dataset, model, config, tokenizer):
     """ Train the model """
+
+    neg_epoch_dataset = PregeneratedDataset(epoch=0, training_path=args.pregenerated_neg_data, tokenizer=tokenizer,
+                                        num_data_epochs=1, reduce_memory=args.reduce_memory)
+
+    pos_epoch_dataset = PregeneratedDataset(epoch=0, training_path=args.pregenerated_pos_data, tokenizer=tokenizer,
+                                        num_data_epochs=1, reduce_memory=args.reduce_memory)
+
     if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
+        tb_writer = None#SummaryWriter()
+
+    if args.local_rank == -1:
+        neg_train_sampler = RandomSampler(neg_epoch_dataset)
+        pos_train_sampler = RandomSampler(pos_epoch_dataset)
+    else:
+        neg_train_sampler = DistributedSampler(neg_epoch_dataset)
+        pos_train_sampler = DistributedSampler(pos_epoch_dataset)
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+
+    neg_train_dataloader = DataLoader(neg_epoch_dataset, sampler=neg_train_sampler, batch_size=args.train_batch_size)
+    pos_train_dataloader = DataLoader(pos_epoch_dataset, sampler=pos_train_sampler, batch_size=args.train_batch_size)
+
+    def neg_inf_train_gen():
+        while True:
+            for kr_step, kr_batch in enumerate(neg_train_dataloader):
+                yield kr_step, kr_batch
+
+    neg_kr_gen = neg_inf_train_gen()
+
+    def pos_inf_train_gen():
+        while True:
+            for kr_step, kr_batch in enumerate(pos_train_dataloader):
+                yield kr_step, kr_batch
+
+    pos_kr_gen = pos_inf_train_gen()
+
+
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
@@ -142,7 +273,8 @@ def train(args, train_dataset, model, config, tokenizer):
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
                       'attention_mask': batch[1],
-                      'labels':         batch[3]}
+                      'labels':         batch[3],
+                      'masked_lm_labels':None}
             if args.model_type != 'distilbert':
                 inputs['token_type_ids'] = batch[2] if args.model_type in ['bert', 'xlnet'] else None  # XLM, DistilBERT and RoBERTa don't use segment_ids
             outputs = model(**inputs)
@@ -172,10 +304,10 @@ def train(args, train_dataset, model, config, tokenizer):
                     # Log metrics
                     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer)
-                        for key, value in results.items():
-                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                    tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+                        # for key, value in results.items():
+                        #     tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+                    # tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     logging_loss = tr_loss
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
@@ -187,6 +319,57 @@ def train(args, train_dataset, model, config, tokenizer):
                     model_to_save.save_pretrained(output_dir)
                     torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                     logger.info("Saving model checkpoint to %s", output_dir)
+
+            if random.random() > args.kr_freq:
+                if random.random() > 0.5:
+                    if args.no_ul:
+                        continue
+                    kr_step, kr_batch = next(neg_kr_gen)
+                    kr_batch = tuple(t.to(args.device) for t in kr_batch)
+                    input_ids, input_mask, segment_ids, lm_label_ids = kr_batch
+
+                    outputs = model(input_ids=input_ids,
+                                               attention_mask=input_mask,
+                                               token_type_ids=segment_ids,
+                                               masked_lm_labels=lm_label_ids,
+                                               negated=True)
+                    loss = outputs[0]
+                else:
+                    kr_step, kr_batch = next(pos_kr_gen)
+                    kr_batch = tuple(t.to(args.device) for t in kr_batch)
+                    input_ids, input_mask, segment_ids, lm_label_ids = kr_batch
+
+                    outputs = model(input_ids=input_ids,
+                                               attention_mask=input_mask,
+                                               token_type_ids=segment_ids,
+                                               masked_lm_labels=lm_label_ids,
+                                               negated=False)
+                    loss = outputs[0]
+
+                if args.n_gpu > 1:
+                    loss = loss.mean() # mean() to average on multi-gpu.
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                if args.fp16:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                tr_loss += loss.item()
+                # nb_tr_examples += input_ids.size(0)
+                # if args.local_rank == 0 or args.local_rank == -1:
+                #     nb_tr_steps += 1
+                #     mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
+                #     pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    scheduler.step()  # Update learning rate schedule
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
 
             if args.tpu:
                 args.xla_model.optimizer_step(optimizer, barrier=True)
@@ -201,7 +384,7 @@ def train(args, train_dataset, model, config, tokenizer):
             break
 
     if args.local_rank in [-1, 0]:
-        tb_writer.close()
+        # tb_writer.close()
         logger.info("Saving model from train to %s", args.output_dir)
         # Save a trained model, configuration and tokenizer using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
@@ -212,18 +395,14 @@ def train(args, train_dataset, model, config, tokenizer):
         tokenizer.save_pretrained(args.output_dir)
         config.save_pretrained(args.output_dir)
 
-    return global_step, 0#tr_loss / global_step
+    return global_step, tr_loss / global_step
 
 
 def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    labeldict = ["contradiction", "entailment", "neutral"]
     if args.separate_evals:
         eval_task_names = ("mnli-contr", "mnli-neut", "mnli-entail") if args.task_name == "mnli" else (args.task_name,)
         eval_outputs_dirs = (args.output_dir+ '-contr', args.output_dir + '-neut', args.output_dir + '-entail') if args.task_name == "mnli" else (args.output_dir,)
-    elif args.stress_test:
-        eval_task_names = ("mnli_stress_neg_m", "mnli_stress_neg_mm") if args.task_name == "mnli" else (args.task_name,)
-        eval_outputs_dirs = (args.output_dir+ '_stress_neg', args.output_dir + '_stress_neg_mm') if args.task_name == "mnli" else (args.output_dir,)
     else:
         eval_task_names = ("mnli", "mnli-mm", "mnli-neg", "mnli-neg-mm") if args.task_name == "mnli" else (args.task_name,)
         eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM', args.output_dir+ 'Neg', args.output_dir + 'Neg-MM') if args.task_name == "mnli" else (args.output_dir,)
@@ -248,12 +427,6 @@ def evaluate(args, model, tokenizer, prefix=""):
         nb_eval_steps = 0
         preds = None
         out_label_ids = None
-
-
-        if eval_task == "mnli-neg" or eval_task == "mnli-neg-mm":
-            output_sentences_eval_file = os.path.join(eval_output_dir, prefix, "sentences_and_labels_{}.txt".format(eval_task))
-            sentence_writer = open(output_sentences_eval_file, "w")
-
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
@@ -266,6 +439,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                     inputs['token_type_ids'] = batch[2] if args.model_type in ['bert', 'xlnet'] else None  # XLM, DistilBERT and RoBERTa don't use segment_ids
                 outputs = model(**inputs)
                 tmp_eval_loss, logits = outputs[:2]
+
                 eval_loss += tmp_eval_loss.mean().item()
             nb_eval_steps += 1
             if preds is None:
@@ -274,14 +448,6 @@ def evaluate(args, model, tokenizer, prefix=""):
             else:
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
-
-            if eval_task == "mnli-neg" or eval_task == "mnli-neg-mm":
-                for idx in range(len(inputs)):
-                    sentence = tokenizer.convert_ids_to_tokens(list(inputs["input_ids"][idx].detach().cpu().numpy())).replace("[PAD]", "").strip()
-                    orig_label = labeldict[inputs["labels"][idx].detach().cpu().numpy()]
-                    predicted_label = labeldict[logits.detach().cpu().numpy()[idx].argmax()]
-                    if orig_label != predicted_label:
-                        sentence_writer.write("{}\t{}\t{}\n".format(sentence, orig_label, predicted_label))
 
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
@@ -297,9 +463,6 @@ def evaluate(args, model, tokenizer, prefix=""):
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
-
-
-
 
     return results
 
@@ -366,7 +529,12 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
 
 def main():
     parser = argparse.ArgumentParser()
-
+    ##Neg params
+    parser.add_argument('--pregenerated_neg_data', type=Path, required=True)
+    parser.add_argument('--pregenerated_pos_data', type=Path, required=True)
+    parser.add_argument("--kr_freq", default=0.9, type=float)
+    parser.add_argument("--reduce_memory", action="store_true",
+                        help="Store training data as on-disc memmaps to massively reduce memory usage")
     ## Required parameters
     parser.add_argument("--data_dir", default=None, type=str, required=True,
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
@@ -393,8 +561,6 @@ def main():
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true',
                         help="Whether to run eval on the dev set.")
-    parser.add_argument("--stress_test", action='store_true',
-                        help="Whether to run eval on the stress dev set.")
     parser.add_argument("--do_aug_train", action='store_true',
                         help="Whether to run train on augmented data")
     parser.add_argument("--evaluate_during_training", action='store_true',
@@ -440,6 +606,8 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
 
+    parser.add_argument('--no_ul', action='store_true',
+                        help="")
     parser.add_argument('--tpu', action='store_true',
                         help="Whether to run on the TPU defined in the environment variables")
     parser.add_argument('--tpu_ip_address', type=str, default='',

@@ -162,6 +162,7 @@ class PretrainedConfig(object):
 
         # Update config with kwargs if needed
         to_remove = []
+        print(kwargs.items())
         for key, value in kwargs.items():
             if hasattr(config, key):
                 setattr(config, key, value)

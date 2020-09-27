@@ -9,6 +9,7 @@ import json
 
 from random import random, randrange, randint, shuffle, choice
 from transformers.tokenization_bert import BertTokenizer
+from transformers.tokenization_roberta import RobertaTokenizer
 import jsonlines
 
 import numpy as np
@@ -107,7 +108,7 @@ MaskedLmInstance = collections.namedtuple("MaskedLmInstance",
 
 
 def create_negated_instances(
-        doc_database, doc_idx, max_seq_length, short_seq_prob, vocab_list):
+        args, doc_database, doc_idx, max_seq_length, short_seq_prob, vocab_list):
     """This code is mostly a duplicate of the equivalent function from Google BERT's repo.
     However, we make some changes and improvements. Sampling is improved and no longer requires a loop in this function.
     Also, documents are sampled proportionally to the number of sentences they contain, which means each sentence
@@ -124,7 +125,10 @@ def create_negated_instances(
 
     assert len(tokens_a) >= 1
 
-    tokens = ["[CLS]"] + tokens_a + ["[SEP]"]
+    if args.bert_model != "roberta-base":
+        tokens = ["[CLS]"] + tokens_a + ["[SEP]"]
+    else:
+        tokens = ["<s>"] + tokens_a + ["</s>"]
 
     target_seq_length = max_num_tokens
     if random() < short_seq_prob:
@@ -133,7 +137,7 @@ def create_negated_instances(
     instances = []
     segment_ids = [0 for _ in range(len(tokens_a) + 2)]
     try:
-        masked_lm_positions = [tokens.index('[MASK]')]
+        masked_lm_positions = [tokens.index('[MASK]')] if args.bert_model != "roberta-base" else [tokens.index('<mask>')]
         masked_lm_labels = [document['obj_label']]
         instance = {"tokens": tokens,
                     "segment_ids": segment_ids,
@@ -141,7 +145,8 @@ def create_negated_instances(
                     "masked_lm_labels": masked_lm_labels}
         instances.append(instance)
     except ValueError as e:
-        print("Did not find [MASK] in the sentence, maybe truncated :/")
+        print("Did not find [MASK] in the sentence, maybe truncated :/" if args.bert_model != "roberta-base" else "Did not find <mask> in the sentence, maybe truncated :/")
+        print(tokens)
         # print ("value error({0}): {1}".format(e.errno, e.strerror))
         masked_lm_positions = list()
         masked_lm_labels = list()
@@ -156,7 +161,7 @@ def create_training_file(docs, vocab_list, args, epoch_num):
     num_instances = 0
     with epoch_filename.open('w') as epoch_file:
         for doc_idx in trange(len(docs), desc="Document"):
-            doc_instances = create_negated_instances(
+            doc_instances = create_negated_instances(args,
                 docs, doc_idx, max_seq_length=args.max_seq_len, short_seq_prob=args.short_seq_prob, vocab_list=vocab_list)
             doc_instances = [json.dumps(instance) for instance in doc_instances]
             for instance in doc_instances:
@@ -177,7 +182,7 @@ def main():
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--bert_model", type=str, required=True,
                         choices=["bert-base-uncased", "bert-large-uncased", "bert-base-cased",
-                                 "bert-base-multilingual-uncased", "bert-base-chinese", "bert-base-multilingual-cased"])
+                                 "bert-base-multilingual-uncased", "bert-base-chinese", "bert-base-multilingual-cased", "roberta-base"])
     parser.add_argument("--do_lower_case", action="store_true")
     parser.add_argument("--do_whole_word_mask", action="store_true",
                         help="Whether to use whole word masking rather than per-WordPiece masking.")
@@ -186,7 +191,7 @@ def main():
 
     parser.add_argument("--num_workers", type=int, default=1,
                         help="The number of workers to use to write the files")
-    parser.add_argument("--epochs_to_generate", type=int, default=3,
+    parser.add_argument("--epochs_to_generate", type=int, default=1,
                         help="Number of epochs of data to pregenerate")
     parser.add_argument("--max_seq_len", type=int, default=128)
     parser.add_argument("--short_seq_prob", type=float, default=0.1,
@@ -201,8 +206,11 @@ def main():
     if args.num_workers > 1 and args.reduce_memory:
         raise ValueError("Cannot use multiple workers while reducing memory")
 
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
-    vocab_list = list(tokenizer.vocab.keys())
+    if args.bert_model != "roberta-base":
+        tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+    else:
+        tokenizer = RobertaTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+    vocab_list = list(tokenizer.vocab.keys()) if args.bert_model != "roberta-base" else list(tokenizer.encoder.keys())
 
 
 

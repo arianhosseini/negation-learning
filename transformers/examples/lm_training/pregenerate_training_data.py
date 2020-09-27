@@ -8,6 +8,7 @@ from multiprocessing import Pool
 
 from random import random, randrange, randint, shuffle, choice
 from transformers.tokenization_bert import BertTokenizer
+from transformers.tokenization_roberta import RobertaTokenizer
 
 import numpy as np
 import json
@@ -103,12 +104,12 @@ def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens):
 MaskedLmInstance = collections.namedtuple("MaskedLmInstance",
                                           ["index", "label"])
 
-def create_masked_lm_predictions(tokens, masked_lm_prob, max_predictions_per_seq, whole_word_mask, vocab_list):
+def create_masked_lm_predictions(args, tokens, masked_lm_prob, max_predictions_per_seq, whole_word_mask, vocab_list):
     """Creates the predictions for the masked LM objective. This is mostly copied from the Google BERT repo, but
     with several refactors to clean it up and remove a lot of unnecessary variables."""
     cand_indices = []
     for (i, token) in enumerate(tokens):
-        if token == "[CLS]" or token == "[SEP]":
+        if token == "[CLS]" or token == "[SEP]" or token == "<s>" or token == "</s>":
             continue
         # Whole Word Masking means that if we mask all of the wordpieces
         # corresponding to an original word. When a word has been split into
@@ -149,7 +150,10 @@ def create_masked_lm_predictions(tokens, masked_lm_prob, max_predictions_per_seq
             masked_token = None
             # 80% of the time, replace with [MASK]
             if random() < 0.8:
-                masked_token = "[MASK]"
+                if args.bert_model != "roberta-base":
+                    masked_token = "[MASK]"
+                else:
+                    masked_token = "<mask>"
             else:
                 # 10% of the time, keep original
                 if random() < 0.5:
@@ -169,7 +173,7 @@ def create_masked_lm_predictions(tokens, masked_lm_prob, max_predictions_per_seq
 
 
 def create_instances_from_document(
-        doc_database, doc_idx, max_seq_length, short_seq_prob,
+        args, doc_database, doc_idx, max_seq_length, short_seq_prob,
         masked_lm_prob, max_predictions_per_seq, whole_word_mask, vocab_list):
     """This code is mostly a duplicate of the equivalent function from Google BERT's repo.
     However, we make some changes and improvements. Sampling is improved and no longer requires a loop in this function.
@@ -177,7 +181,11 @@ def create_instances_from_document(
     (rather than each document) has an equal chance of being sampled as a false example for the NextSentence task."""
     document = doc_database[doc_idx]
     # Account for [CLS], [SEP], [SEP]
-    max_num_tokens = max_seq_length - 3
+    if args.bert_model != "roberta-base":
+        max_num_tokens = max_seq_length - 3
+    else:
+        #cause there are two </s>s
+        max_num_tokens = max_seq_length - 4
 
     # We *usually* want to fill up the entire sequence since we are padding
     # to `max_seq_length` anyways, so short sequences are generally wasted
@@ -244,13 +252,21 @@ def create_instances_from_document(
                 assert len(tokens_a) >= 1
                 assert len(tokens_b) >= 1
 
-                tokens = ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b + ["[SEP]"]
+                if args.bert_model != "roberta-base":
+                    tokens = ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b + ["[SEP]"]
+                    segment_ids = [0 for _ in range(len(tokens_a) + 2)] + [1 for _ in range(len(tokens_b) + 1)]
+                else:
+                    tokens = ["<s>"] + tokens_a + ["</s>", "</s>"] + tokens_b + ["</s>"]
+                    segment_ids = [0 for _ in range(len(tokens_a) + 2)] + [1 for _ in range(len(tokens_b) + 2)]
+
+
                 # The segment IDs are 0 for the [CLS] token, the A tokens and the first [SEP]
                 # They are 1 for the B tokens and the final [SEP]
-                segment_ids = [0 for _ in range(len(tokens_a) + 2)] + [1 for _ in range(len(tokens_b) + 1)]
+
+                # segment_ids = [0 for _ in range(len(tokens_a) + 2)] + [1 for _ in range(len(tokens_b) + 1)]
 
                 tokens, masked_lm_positions, masked_lm_labels = create_masked_lm_predictions(
-                    tokens, masked_lm_prob, max_predictions_per_seq, whole_word_mask, vocab_list)
+                    args, tokens, masked_lm_prob, max_predictions_per_seq, whole_word_mask, vocab_list)
 
                 instance = {
                     "tokens": tokens,
@@ -273,7 +289,7 @@ def create_training_file(docs, vocab_list, args, epoch_num):
     with epoch_filename.open('w') as epoch_file:
         for doc_idx in trange(len(docs), desc="Document"):
             doc_instances = create_instances_from_document(
-                docs, doc_idx, max_seq_length=args.max_seq_len, short_seq_prob=args.short_seq_prob,
+                args, docs, doc_idx, max_seq_length=args.max_seq_len, short_seq_prob=args.short_seq_prob,
                 masked_lm_prob=args.masked_lm_prob, max_predictions_per_seq=args.max_predictions_per_seq,
                 whole_word_mask=args.do_whole_word_mask, vocab_list=vocab_list)
             doc_instances = [json.dumps(instance) for instance in doc_instances]
@@ -294,7 +310,7 @@ def main():
     parser.add_argument('--train_corpus', type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--bert_model", type=str, required=True,
-                        choices=["bert-base-uncased", "bert-large-uncased", "bert-base-cased",
+                        choices=["roberta-base", "bert-base-uncased", "bert-large-uncased", "bert-base-cased",
                                  "bert-base-multilingual-uncased", "bert-base-chinese", "bert-base-multilingual-cased"])
     parser.add_argument("--do_lower_case", action="store_true")
     parser.add_argument("--do_whole_word_mask", action="store_true",
@@ -319,8 +335,12 @@ def main():
     if args.num_workers > 1 and args.reduce_memory:
         raise ValueError("Cannot use multiple workers while reducing memory")
 
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
-    vocab_list = list(tokenizer.vocab.keys())
+    if args.bert_model != "roberta-base":
+        tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+        vocab_list = list(tokenizer.vocab.keys())
+    else:
+        tokenizer = RobertaTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+        vocab_list = list(tokenizer.encoder.keys())
 
 
 

@@ -71,6 +71,8 @@ if _has_sklearn:
             return acc_and_f1(preds, labels)
         elif task_name == "mnli":
             return {"acc": simple_accuracy(preds, labels)}
+        elif task_name in ["mnli-contr", "mnli-neut", "mnli-entail", "mnli-neg", "mnli-neg-mm", "mnli_stress_neg_m", "mnli_stress_neg_mm"]:
+            return {"acc": simple_accuracy(preds, labels)}
         elif task_name == "mnli-mm":
             return {"acc": simple_accuracy(preds, labels)}
         elif task_name == "qnli":

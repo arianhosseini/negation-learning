@@ -204,6 +204,16 @@ class MnliProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+    def get_augtrain_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train_aug.tsv")), "train_aug")
+
+    def get_stress_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_stress_examples(
+            self._read_tsv(os.path.join(data_dir, "multinli_0.9_negation_matched.txt")),
+            "stress_matched")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
@@ -214,6 +224,19 @@ class MnliProcessor(DataProcessor):
     def get_labels(self):
         """See base class."""
         return ["contradiction", "entailment", "neutral"]
+
+    def _create_stress_examples(self, lines, set_type):
+        examples = []
+        for (i, line) in enumerate(lines):
+            if i == 0:
+                continue
+            guid = "%s-%s" % (set_type, line[8])
+            text_a = line[5]
+            text_b = line[6]
+            label = line[0]
+            examples.append(
+                InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+        return examples
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
@@ -238,6 +261,75 @@ class MnliMismatchedProcessor(MnliProcessor):
         return self._create_examples(
             self._read_tsv(os.path.join(data_dir, "dev_mismatched.tsv")),
             "dev_matched")
+    def get_stress_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_stress_examples(
+            self._read_tsv(os.path.join(data_dir, "multinli_0.9_negation_mismatched.txt")),
+            "stress_mismatched")
+class MnliNegProcessor(MnliProcessor):
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "dev_neg_matched.tsv")),
+            "dev_neg_matched")
+class MnliNegMismatchedProcessor(MnliProcessor):
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "dev_neg_mismatched.tsv")),
+            "dev_neg_mismatched")
+
+class MnliStressProcessor(MnliProcessor):
+    """Processor for the MultiNLI Mismatched data set (GLUE version)."""
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_stress_examples(
+            self._read_tsv(os.path.join(data_dir, "multinli_0.9_negation_matched.txt")),
+            "stress_matched")
+
+        # return self._create_examples(
+        #     self._read_tsv(os.path.join(data_dir, "dev_contr.tsv")),
+        #     "dev_contr")
+
+class MnliStressMismatchedProcessor(MnliProcessor):
+    """Processor for the MultiNLI Mismatched data set (GLUE version)."""
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_stress_examples(
+            self._read_tsv(os.path.join(data_dir, "multinli_0.9_negation_mismatched.txt")),
+            "stress_mismatched")
+        # return self._create_examples(
+        #     self._read_tsv(os.path.join(data_dir, "dev_contr.tsv")),
+        #     "dev_contr")
+
+
+class MnliContrProcessor(MnliProcessor):
+    """Processor for the MultiNLI Mismatched data set (GLUE version)."""
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "dev_contr.tsv")),
+            "dev_contr")
+
+class MnliNeutProcessor(MnliProcessor):
+    """Processor for the MultiNLI Mismatched data set (GLUE version)."""
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "dev_neut.tsv")),
+            "dev_contr")
+class MnliEntailProcessor(MnliProcessor):
+    """Processor for the MultiNLI Mismatched data set (GLUE version)."""
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "dev_entail.tsv")),
+            "dev_contr")
+
 
 
 class ColaProcessor(DataProcessor):
@@ -527,7 +619,14 @@ glue_tasks_num_labels = {
 glue_processors = {
     "cola": ColaProcessor,
     "mnli": MnliProcessor,
+    "mnli-neg": MnliNegProcessor,
+    "mnli-neg-mm": MnliNegMismatchedProcessor,
     "mnli-mm": MnliMismatchedProcessor,
+    "mnli-contr": MnliContrProcessor,
+    "mnli-neut": MnliNeutProcessor,
+    "mnli-entail": MnliEntailProcessor,
+    "mnli_stress_neg_m": MnliStressProcessor,
+    "mnli_stress_neg_mm": MnliStressMismatchedProcessor,
     "mrpc": MrpcProcessor,
     "sst-2": Sst2Processor,
     "sts-b": StsbProcessor,
@@ -540,7 +639,14 @@ glue_processors = {
 glue_output_modes = {
     "cola": "classification",
     "mnli": "classification",
+    "mnli-neg": "classification",
+    "mnli-neg-mm": "classification",
     "mnli-mm": "classification",
+    "mnli-contr": "classification",
+    "mnli-neut": "classification",
+    "mnli-entail": "classification",
+    "mnli_stress_neg_m": "classification",
+    "mnli_stress_neg_mm": "classification",
     "mrpc": "classification",
     "sst-2": "classification",
     "sts-b": "regression",

@@ -201,6 +201,7 @@ class PreTrainedModel(nn.Module):
 
         # If we save using the predefined names, we can load using `from_pretrained`
         output_model_file = os.path.join(save_directory, WEIGHTS_NAME)
+        # print(model_to_save.state_dict().keys())
         torch.save(model_to_save.state_dict(), output_model_file)
         logger.info("Model weights saved in {}".format(output_model_file))
 
@@ -340,9 +341,11 @@ class PreTrainedModel(nn.Module):
 
         # Instantiate model.
         model = cls(config, *model_args, **model_kwargs)
+        print("Instantiating CLS: ", cls)
 
         if state_dict is None and not from_tf:
             state_dict = torch.load(resolved_archive_file, map_location='cpu')
+            # print(state_dict.keys())
 
         missing_keys = []
         unexpected_keys = []
@@ -372,7 +375,9 @@ class PreTrainedModel(nn.Module):
                     new_key = key.replace('gamma', 'weight')
                 if 'beta' in key:
                     new_key = key.replace('beta', 'bias')
-                if 'classifier' in key:
+                if 'classifier' in key and (str(cls)!= "<class 'transformers.modeling_bert.BertForSequenceClassification'>" and str(cls)!= "<class 'transformers.modeling_bert.BertForNegSequenceClassification'>"):
+                    print(str(cls))
+                    print("\n\nimmo remove bro\n\n\n\n")
                     remove_keys.append(key)
                 if new_key:
                     old_keys.append(key)

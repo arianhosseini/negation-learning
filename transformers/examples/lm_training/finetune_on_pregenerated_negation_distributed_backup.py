@@ -14,13 +14,10 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
 
 from transformers import WEIGHTS_NAME, CONFIG_NAME
 from transformers.modeling_bert import BertForPreTraining, BertConfig, BertForNegPreTraining, BertForNegKLPreTraining
-from transformers.modeling_roberta import RobertaForNegPreTraining, RobertaConfig
 from transformers.tokenization_bert import BertTokenizer
-from transformers.tokenization_roberta import RobertaTokenizer
 from transformers.optimization import AdamW, WarmupLinearSchedule
 import dist_comms
 
@@ -209,15 +206,9 @@ def main():
     parser.add_argument('--no_ul',
                         action='store_true',
                         help="don't do any UL training")
-    parser.add_argument('--no_ll',
-                        action='store_true',
-                        help="don't do any LL training")
     parser.add_argument('--fp16',
                         action='store_true',
                         help="Whether to use 16-bit float precision instead of 32-bit")
-    parser.add_argument('--notonly',
-                        action='store_true',
-                        help="")
     parser.add_argument('--fp16_opt_level', type=str, default='O1',
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
@@ -319,12 +310,7 @@ def main():
         logging.warning(f"Output directory ({args.output_dir}) already exists and is not empty!")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.bert_model != "roberta-base":
-        tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
-    else:
-        tokenizer = RobertaTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
-        tokenizer.vocab = tokenizer.encoder
-
+    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
 
     total_train_examples = 0
     for i in range(args.epochs):
@@ -337,23 +323,14 @@ def main():
         num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     # Prepare model
-    if args.bert_model != "roberta-base":
-        config = BertConfig.from_pretrained(args.bert_model)
-        core_model = BertForNegPreTraining.from_pretrained('bert-base-cased')
-    else:
-        config = RobertaConfig.from_pretrained(args.bert_model)
-        core_model = RobertaForNegPreTraining.from_pretrained(args.bert_model)
+    config = BertConfig.from_pretrained(args.bert_model)
 
     # core_model = BertForNegPreTraining.from_pretrained('bert-base-cased')
-    # core_model = BertForNegKLPreTraining.from_pretrained('bert-base-cased')
+    core_model = BertForNegKLPreTraining.from_pretrained('bert-base-cased')
     core_model = core_model.to(device)
 
     # Prepare optimizer
-    if args.notonly:
-        not_token_id = 1136
-        param_optimizer = list(core_model.bert.embeddings.word_embeddings.named_parameters())
-    else:
-        param_optimizer = list(core_model.named_parameters())
+    param_optimizer = list(core_model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
@@ -384,7 +361,6 @@ def main():
         print("Before training path: ", before_train_path)
         before_train_path.mkdir(parents=True, exist_ok=True)
         model.module.save_pretrained(os.path.join(args.output_dir,"before_training"))
-        # writer = SummaryWriter()
 
         tokenizer.save_pretrained(os.path.join(args.output_dir, "before_training"))
 
@@ -453,9 +429,6 @@ def main():
 
         gkb_pos_gen = gkb_pos_inf_train_gen()
 
-    mlm_loss, neg_loss = 0,0
-    mlm_nb_it, neg_nb_it = 1,1
-    mlm_nb_ex, neg_nb_ex = 0,0
 
 
     for epoch in range(args.epochs):
@@ -468,19 +441,8 @@ def main():
 
         train_dataloader = DataLoader(epoch_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
-
-
         tr_loss = 0
         nb_tr_examples, nb_tr_steps = 0, 0
-
-        ul_tr_loss = 0
-        nb_ul_tr_examples, nb_ul_tr_steps = 0, 1
-        ll_tr_loss = 0
-        nb_ll_tr_examples, nb_ll_tr_steps = 0, 1
-        kl_tr_loss = 0
-        nb_kl_tr_examples, nb_kl_tr_steps = 0, 1
-
-
 
         if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
             logging.info("** ** * Saving fine-tuned model ** ** * ")
@@ -500,31 +462,15 @@ def main():
                                     token_type_ids=segment_ids,
                                     masked_lm_labels=lm_label_ids,
                                     negated=False)
-
-                    loss = outputs[1]
-                    loss_dict = outputs[0]
-                    mlm_loss += loss_dict['mlm'].item()
-                    mlm_nb_it += 1
-                    mlm_nb_ex += input_ids.size(0)
-                    # loss_values = outputs[1:4]
-                    # ll_tr_loss += loss_values[1]
-
-
+                    loss = outputs[0]
                     if n_gpu > 1:
                         loss = loss.mean() # mean() to average on multi-gpu.
-
                     if args.gradient_accumulation_steps > 1:
                         loss = loss / args.gradient_accumulation_steps
 
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer) as scaled_loss:
                             scaled_loss.backward()
-                            if args.notonly:
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad)
-                                optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] = optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] * 0.
-                                optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1:] = optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1: ] * 0.
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad[not_token_id-1])
-
                         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                     else:
                         loss.backward()
@@ -535,16 +481,9 @@ def main():
 
                     if args.local_rank == 0 or args.local_rank == -1:
                         nb_tr_steps += 1
-                        nb_ll_tr_steps += 1
                         # pbar.update(1)
                         mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-                        # pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
-                        mlm_mean_loss = mlm_loss / mlm_nb_it
-                        neg_mean_loss = neg_loss / neg_nb_it
-
-                        # writer.add_scalar('MLM/train', loss_dict['mlm'].item(), mlm_nb_it)
-
-                        pbar.set_postfix_str(f"MLM: {mlm_mean_loss:.3f}, UL: {neg_mean_loss:.3f}")
+                        pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         scheduler.step()  # Update learning rate schedule
                         optimizer.step()
@@ -563,17 +502,8 @@ def main():
                                         token_type_ids=segment_ids,
                                         masked_lm_labels=lm_label_ids,
                                         negated=True)
-                        loss = outputs[1]
-                        loss_dict = outputs[0]
-                        nb_ul_tr_steps += 1
-                        neg_loss += loss_dict['neg'].item()
-                        if args.local_rank == 0 or args.local_rank == -1:
-                            pass
-                            # writer.add_scalar('UL/train', loss_dict['neg'].item(), neg_nb_it)
-
-                        neg_nb_it += 1
-                        neg_nb_ex += input_ids.size(0)
-                    elif not args.no_ll:
+                        loss = outputs[0]
+                    else:
                         kr_step, kr_batch = next(pos_kr_gen)
                         kr_batch = tuple(t.to(device) for t in kr_batch)
                         input_ids, input_mask, segment_ids, lm_label_ids = kr_batch
@@ -583,19 +513,7 @@ def main():
                                         token_type_ids=segment_ids,
                                         masked_lm_labels=lm_label_ids,
                                         negated=False)
-                        loss = outputs[1]
-                        loss_dict = outputs[0]
-                        nb_ll_tr_steps += 1
-
-                        mlm_loss += loss_dict['mlm'].item()
-
-                        mlm_nb_it += 1
-                        if args.local_rank == 0 or args.local_rank == -1:
-                            pass
-                            # writer.add_scalar('MLM/train', loss_dict['mlm'].item(), mlm_nb_it)
-                        mlm_nb_ex += input_ids.size(0)
-                    else:
-                        continue
+                        loss = outputs[0]
 
                     if n_gpu > 1:
                         loss = loss.mean() # mean() to average on multi-gpu.
@@ -605,36 +523,17 @@ def main():
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer) as scaled_loss:
                             scaled_loss.backward()
-                            if args.notonly:
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad)
-                                optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] = optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] * 0.
-                                optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1:] = optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1: ] * 0.
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1])
                         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                     else:
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-                    # loss_values = outputs[1:4]
-                    # ll_tr_loss += loss_values[1]
-                    # ul_tr_loss += loss_values[0]
-                    # kl_tr_loss += loss_values[2]
-
 
                     tr_loss += loss.item()
                     nb_tr_examples += input_ids.size(0)
                     if args.local_rank == 0 or args.local_rank == -1:
                         nb_tr_steps += 1
                         mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-
-                        kl_mean_loss = kl_tr_loss / nb_ul_tr_steps
-                        ul_mean_loss = ul_tr_loss / nb_ul_tr_steps
-                        ll_mean_loss = ll_tr_loss / nb_ll_tr_steps
-
-                        mlm_mean_loss = mlm_loss / mlm_nb_it
-                        neg_mean_loss = neg_loss / neg_nb_it
-
-                        pbar.set_postfix_str(f"MLM: {mlm_mean_loss:.3f}, UL: {neg_mean_loss:.3f}")
+                        pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         scheduler.step()  # Update learning rate schedule
                         optimizer.step()
@@ -682,8 +581,7 @@ def main():
                     if args.local_rank == 0 or args.local_rank == -1:
                         nb_tr_steps += 1
                         mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-
-                        pbar.set_postfix_str(f"mlm: {mean_loss:.5f}")
+                        pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         scheduler.step()  # Update learning rate schedule
                         optimizer.step()
