@@ -17,11 +17,12 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from transformers import WEIGHTS_NAME, CONFIG_NAME
-from transformers.modeling_bert import BertForPreTraining, BertConfig, BertForNegPreTraining, BertForNegKLPreTraining
+from transformers.modeling_bert import BertForPreTraining, BertConfig, BertForNegPreTraining, BertForNegKLPreTraining, BertForNegKLDoublePreTraining, BertForNegKLNoTiePreTraining, BertForNegDistillation
 from transformers.modeling_roberta import RobertaForNegPreTraining, RobertaConfig
 from transformers.tokenization_bert import BertTokenizer
 from transformers.tokenization_roberta import RobertaTokenizer
 from transformers.optimization import AdamW, WarmupLinearSchedule
+from transformers.log_utils import AverageMeter
 import dist_comms
 
 
@@ -163,7 +164,11 @@ def main():
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument("--bert_model", type=str, required=True, help="Bert pre-trained model selected in the list: bert-base-uncased, "
                              "bert-large-uncased, bert-base-cased, bert-base-multilingual, bert-base-chinese.")
+    parser.add_argument("--do_kl", action="store_true")
+    parser.add_argument("--do_distill", action="store_true")
+    parser.add_argument("--do_ll_kl", action="store_true")
     parser.add_argument("--do_lower_case", action="store_true")
+    parser.add_argument("--save_before", action='store_true')
     parser.add_argument("--reduce_memory", action="store_true",
                         help="Store training data as on-disc memmaps to massively reduce memory usage")
 
@@ -203,9 +208,15 @@ def main():
     parser.add_argument("--gkb_freq",
                         default=0.9,
                         type=float)
+    parser.add_argument("--kl_w",
+                        default=1000,
+                        type=float)
     parser.add_argument('--no_mlm',
                         action='store_true',
                         help="don't do any MLM training")
+    parser.add_argument("--no_tie",
+                        action='store_true',
+                        help="Whether not to use CUDA when available")
     parser.add_argument('--no_ul',
                         action='store_true',
                         help="don't do any UL training")
@@ -288,7 +299,7 @@ def main():
         print(torch.cuda.is_available())
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         n_gpu = torch.cuda.device_count()
-        print(n_gpu)
+        print("Num of gpus: ", n_gpu)
     else:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
@@ -338,8 +349,25 @@ def main():
 
     # Prepare model
     if args.bert_model != "roberta-base":
-        config = BertConfig.from_pretrained(args.bert_model)
-        core_model = BertForNegPreTraining.from_pretrained('bert-base-cased')
+        if not args.do_kl:
+            if not args.do_distill:
+                config = BertConfig.from_pretrained(args.bert_model)
+                core_model = BertForNegPreTraining.from_pretrained('bert-base-cased')
+            else:
+                config = BertConfig.from_pretrained(args.bert_model)
+                core_model = BertForNegDistillation.from_pretrained('bert-base-cased')
+
+        elif not args.do_ll_kl:
+            if not args.no_tie:
+                config = BertConfig.from_pretrained(args.bert_model)
+                core_model = BertForNegKLPreTraining.from_pretrained('bert-base-cased')
+            else:
+                config = BertConfig.from_pretrained(args.bert_model)
+                core_model = BertForNegKLNoTiePreTraining.from_pretrained('bert-base-cased')
+
+        elif args.do_kl and args.do_ll_kl:
+            config = BertConfig.from_pretrained(args.bert_model)
+            core_model = BertForNegKLDoublePreTraining.from_pretrained('bert-base-cased')
     else:
         config = RobertaConfig.from_pretrained(args.bert_model)
         core_model = RobertaForNegPreTraining.from_pretrained(args.bert_model)
@@ -354,6 +382,7 @@ def main():
         param_optimizer = list(core_model.bert.embeddings.word_embeddings.named_parameters())
     else:
         param_optimizer = list(core_model.named_parameters())
+
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
@@ -380,13 +409,19 @@ def main():
     model.train()
 
     if args.local_rank == 0 or args.local_rank == -1:
-        before_train_path = Path(os.path.join(args.output_dir,"before_training"))
-        print("Before training path: ", before_train_path)
-        before_train_path.mkdir(parents=True, exist_ok=True)
-        model.module.save_pretrained(os.path.join(args.output_dir,"before_training"))
-        # writer = SummaryWriter()
+        if args.save_before:
+            before_train_path = Path(os.path.join(args.output_dir,"before_training"))
+            print("Before training path: ", before_train_path)
+            before_train_path.mkdir(parents=True, exist_ok=True)
+            model.module.save_pretrained(os.path.join(args.output_dir,"before_training"))
+            tokenizer.save_pretrained(os.path.join(args.output_dir, "before_training"))
 
-        tokenizer.save_pretrained(os.path.join(args.output_dir, "before_training"))
+        writer = SummaryWriter(log_dir=args.output_dir)
+        mlm_averagemeter = AverageMeter()
+        ul_averagemeter = AverageMeter()
+        ll_averagemeter = AverageMeter()
+        kl_averagemeter = AverageMeter()
+
 
     neg_epoch_dataset = PregeneratedDataset(epoch=0, training_path=args.pregenerated_neg_data, tokenizer=tokenizer,
                                         num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
@@ -504,6 +539,9 @@ def main():
                     loss = outputs[1]
                     loss_dict = outputs[0]
                     mlm_loss += loss_dict['mlm'].item()
+
+
+
                     mlm_nb_it += 1
                     mlm_nb_ex += input_ids.size(0)
                     # loss_values = outputs[1:4]
@@ -534,6 +572,9 @@ def main():
                     nb_tr_examples += input_ids.size(0)
 
                     if args.local_rank == 0 or args.local_rank == -1:
+                        mlm_averagemeter.update(loss_dict['mlm'].item())
+                        writer.add_scalar('MLM/train', loss_dict['mlm'].item(), mlm_nb_it)
+
                         nb_tr_steps += 1
                         nb_ll_tr_steps += 1
                         # pbar.update(1)
@@ -542,9 +583,10 @@ def main():
                         mlm_mean_loss = mlm_loss / mlm_nb_it
                         neg_mean_loss = neg_loss / neg_nb_it
 
-                        # writer.add_scalar('MLM/train', loss_dict['mlm'].item(), mlm_nb_it)
 
-                        pbar.set_postfix_str(f"MLM: {mlm_mean_loss:.3f}, UL: {neg_mean_loss:.3f}")
+
+                        pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.4f}, UL: {ul_averagemeter:.4f}, LL: {ll_averagemeter:.4f}, KL: {kl_averagemeter:.4f}")
+
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         scheduler.step()  # Update learning rate schedule
                         optimizer.step()
@@ -564,12 +606,19 @@ def main():
                                         masked_lm_labels=lm_label_ids,
                                         negated=True)
                         loss = outputs[1]
+                        if args.do_kl:
+                            loss += outputs[0]['kl'] * args.kl_w
+
                         loss_dict = outputs[0]
                         nb_ul_tr_steps += 1
+
                         neg_loss += loss_dict['neg'].item()
                         if args.local_rank == 0 or args.local_rank == -1:
-                            pass
-                            # writer.add_scalar('UL/train', loss_dict['neg'].item(), neg_nb_it)
+                            writer.add_scalar('UL/train', loss_dict['neg'].item(), neg_nb_it)
+                            writer.add_scalar('KL/train', loss_dict['kl'].item() * args.kl_w, neg_nb_it)
+                            ul_averagemeter.update(loss_dict['neg'].item())
+                            kl_averagemeter.update(loss_dict['kl'].item() * args.kl_w)
+
 
                         neg_nb_it += 1
                         neg_nb_ex += input_ids.size(0)
@@ -584,6 +633,8 @@ def main():
                                         masked_lm_labels=lm_label_ids,
                                         negated=False)
                         loss = outputs[1]
+                        if args.do_ll_kl:
+                            loss += outputs[0]['kl'] * args.kl_w
                         loss_dict = outputs[0]
                         nb_ll_tr_steps += 1
 
@@ -591,8 +642,10 @@ def main():
 
                         mlm_nb_it += 1
                         if args.local_rank == 0 or args.local_rank == -1:
-                            pass
-                            # writer.add_scalar('MLM/train', loss_dict['mlm'].item(), mlm_nb_it)
+                            writer.add_scalar('LL/train', loss_dict['mlm'].item(), mlm_nb_it)
+                            ll_averagemeter.update(loss_dict['mlm'].item())
+
+
                         mlm_nb_ex += input_ids.size(0)
                     else:
                         continue
@@ -634,7 +687,9 @@ def main():
                         mlm_mean_loss = mlm_loss / mlm_nb_it
                         neg_mean_loss = neg_loss / neg_nb_it
 
-                        pbar.set_postfix_str(f"MLM: {mlm_mean_loss:.3f}, UL: {neg_mean_loss:.3f}")
+                        # pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.3f}, UL: {ul_averagemeter:.3f}, LL: {ll_averagemeter:.3f}")
+                        pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.4f}, UL: {ul_averagemeter:.4f}, LL: {ll_averagemeter:.4f}, KL: {kl_averagemeter:.4f}")
+                        # pbar.set_postfix_str(f"MLM: {mlm_mean_loss:.3f}, UL: {neg_mean_loss:.3f}")
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         scheduler.step()  # Update learning rate schedule
                         optimizer.step()
@@ -689,8 +744,6 @@ def main():
                         optimizer.step()
                         optimizer.zero_grad()
                         global_step += 1
-
-
 
 
     # Save a trained model

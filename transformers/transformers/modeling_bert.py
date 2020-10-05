@@ -907,6 +907,317 @@ class BertForNegSequenceClassification(BertPreTrainedModel):
 
         return outputs  # (masked_lm_loss), prediction_scores, (hidden_states), (attentions)
 
+class BertForNegKLDoublePreTraining(BertPreTrainedModel):
+    r"""
+        **masked_lm_labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size, sequence_length)``:
+            Labels for computing the masked language modeling loss.
+            Indices should be in ``[-1, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring)
+            Tokens with indices set to ``-1`` are ignored (masked), the loss is only computed for the tokens with labels
+            in ``[0, ..., config.vocab_size]``
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **loss**: (`optional`, returned when ``masked_lm_labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Masked language modeling loss.
+        **prediction_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length, config.vocab_size)``
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForMaskedLM.from_pretrained('bert-base-uncased')
+        input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute")).unsqueeze(0)  # Batch size 1
+        outputs = model(input_ids, masked_lm_labels=input_ids)
+        loss, prediction_scores = outputs[:2]
+
+    """
+    def __init__(self, config):
+        super(BertForNegKLDoublePreTraining, self).__init__(config)
+
+        self.bert = BertModel(config)
+        self.cls = BertOnlyMLMHead(config)
+        self.softmax = nn.Softmax(dim=2)
+        self.original_model_softmax = nn.Softmax(dim=1)
+        self.original_bert = BertForMaskedLM.from_pretrained('bert-base-cased')
+        self.original_bert.eval()
+
+        self.kl_loss = nn.KLDivLoss() #batchmean
+        self.log_softmax = nn.LogSoftmax(dim = 1)
+        print("setting require grad to false for original bert")
+        for p in self.original_bert.parameters():
+            p.requires_grad = False
+
+        self.init_weights()
+        self.tie_weights()
+
+    def tie_weights(self):
+        """ Make sure we are sharing the input and output embeddings.
+            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
+        """
+        self._tie_or_clone_weights(self.cls.predictions.decoder,
+                                   self.bert.embeddings.word_embeddings)
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
+                masked_lm_labels=None, negated=True):
+
+        loss_dict = {'mlm': 0.0, 'neg': 0.0, 'kl':torch.Tensor([0])}
+
+        kl_loss_value = 0
+        ul_loss_value = 0
+        ll_loss_value = 0
+
+
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask)
+
+        sequence_output = outputs[0]
+        prediction_scores = self.cls(sequence_output)
+
+        outputs = (prediction_scores,) + outputs[2:]  # Add hidden states and attention if they are here
+        if not negated:
+            if masked_lm_labels is not None:
+                loss_fct = CrossEntropyLoss(ignore_index=-1)
+                masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
+                # ll_loss_value = masked_lm_loss.item()
+                loss_dict['mlm'] = masked_lm_loss
+
+                #KL loss
+                original_probs_mask = torch.ne(masked_lm_labels, -1).float()
+                lm_labels_mask = torch.ne(masked_lm_labels, -1) #too many masks
+
+
+                with torch.no_grad():
+                    original_scores = self.original_bert(input_ids,     #bs,l,vocab_size
+                                                         attention_mask=attention_mask,
+                                                         token_type_ids=token_type_ids,
+                                                         position_ids=position_ids,
+                                                         head_mask=head_mask)[0]
+
+                    original_scores.detach() #bs x ln x vocab
+                    orig_masked_probs = original_scores[lm_labels_mask] #bs or more x vocab
+                    orig_masked_probs = self.original_model_softmax(orig_masked_probs) #bs or more , vs
+                    dummy_loss = original_scores.sum() * 0.
+
+
+                new_masked_probs = prediction_scores[lm_labels_mask] #bs or more, vocab_size
+                new_masked_probs = self.log_softmax(new_masked_probs) #bs or more, vs
+                kl_consistency_loss = self.kl_loss(new_masked_probs, orig_masked_probs)
+                loss_dict['kl'] = kl_consistency_loss
+
+
+                outputs = (masked_lm_loss,) + outputs
+
+
+        else:
+            original_probs_mask = torch.ne(masked_lm_labels, -1).float()
+            lm_labels_mask = torch.ne(masked_lm_labels, -1) #too many masks
+            true_ids = masked_lm_labels[lm_labels_mask] #shoud be bs?
+
+            with torch.no_grad():
+                original_scores = self.original_bert(input_ids,     #bs,l,vocab_size
+                                                     attention_mask=attention_mask,
+                                                     token_type_ids=token_type_ids,
+                                                     position_ids=position_ids,
+                                                     head_mask=head_mask)[0]
+                # print(original_scores.shape)
+                original_scores.detach() #bs x ln x vocab
+                # orig_masked_probs = (original_scores * original_probs_mask.unsqueeze(2)).sum(1) #bs, vocab_size
+
+                orig_masked_probs = original_scores[lm_labels_mask]
+                # print("orig_masked_probs:", orig_masked_probs.size())
+
+
+                # print(true_ids.shape) #should be equal to num of masks
+                orig_masked_probs.scatter_(1, true_ids.unsqueeze(1) ,-100) #put -100 in the gold ids probability
+
+                orig_masked_probs = self.original_model_softmax(orig_masked_probs) #bs , vs
+                dummy_loss = original_scores.sum() * 0.
+
+
+            # new_masked_probs = (prediction_scores * original_probs_mask.unsqueeze(2)).sum(1)
+            new_masked_probs = prediction_scores[lm_labels_mask] #bs, vocab_size
+            new_masked_probs.scatter_(1, true_ids.unsqueeze(1) ,-100) #put -100 in the gold ids probability
+            new_masked_probs = self.log_softmax(new_masked_probs) #bs, vs
+            kl_consistency_loss = self.kl_loss(new_masked_probs, orig_masked_probs)
+            # kl_consistency_loss = (orig_masked_probs * (torch.log(orig_masked_probs + 1e-6) - torch.log(new_masked_probs + 1e-6))).sum(1).mean() * 100
+            # kl_loss_value = kl_consistency_loss.item()
+            loss_dict['kl'] = kl_consistency_loss
+
+            # print("kl loss: ", kl_consistency_loss)
+
+            prediction_probs = self.softmax(prediction_scores)
+            prediction_probs = torch.log(1. - prediction_probs.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)])
+            probs_mask = 1. - torch.eq(masked_lm_labels.view(-1), -1).float()
+            # print("mask:", probs_mask.shape)
+            prediction_probs = prediction_probs * probs_mask
+            # print("probs: ", prediction_probs.shape)
+            # print(masked_lm_labels[0,:])
+            masked_lm_loss = - prediction_probs.sum()
+            # ul_loss_value = masked_lm_loss.item()
+            loss_dict['neg'] = masked_lm_loss
+
+            # masked_lm_loss += kl_consistency_loss
+            # print("LOSS: ", masked_lm_loss)
+            # prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)] = 1. - prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)]
+            # prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)] = 1. - prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)]
+            # prediction_scores[torch.arange(prediction_scores.shape[0]),torch.arange(prediction_scores.shape[1]), masked_lm_labels] = 1. - prediction_scores[torch.arange(prediction_scores.shape[0]), masked_lm_labels]
+            # outputs = (prediction_scores,) + outputs[2:]  # Add hidden states and attention if they are here
+            if masked_lm_labels is not None:
+                outputs = (masked_lm_loss,) + outputs
+                # loss_fct = CrossEntropyLoss(ignore_index=-1)
+                # masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
+                # print((ul_loss_value, ll_loss_value, kl_loss_value))
+                # outputs = (masked_lm_loss,ul_loss_value, ll_loss_value, kl_loss_value,) + outputs
+        return (loss_dict, ) + outputs
+        # return outputs  # (masked_lm_loss), prediction_scores, (hidden_states), (attentions)
+
+class BertForNegDistillation(BertPreTrainedModel):
+    r"""
+        **masked_lm_labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size, sequence_length)``:
+            Labels for computing the masked language modeling loss.
+            Indices should be in ``[-1, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring)
+            Tokens with indices set to ``-1`` are ignored (masked), the loss is only computed for the tokens with labels
+            in ``[0, ..., config.vocab_size]``
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **loss**: (`optional`, returned when ``masked_lm_labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Masked language modeling loss.
+        **prediction_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length, config.vocab_size)``
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForMaskedLM.from_pretrained('bert-base-uncased')
+        input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute")).unsqueeze(0)  # Batch size 1
+        outputs = model(input_ids, masked_lm_labels=input_ids)
+        loss, prediction_scores = outputs[:2]
+
+    """
+    def __init__(self, config):
+        super(BertForNegDistillation, self).__init__(config)
+
+        self.bert = BertModel(config)
+        self.cls = BertOnlyMLMHead(config)
+        self.softmax = nn.Softmax(dim=2)
+        self.original_model_softmax = nn.Softmax(dim=1)
+        self.original_bert = BertForMaskedLM.from_pretrained('bert-base-cased')
+        self.original_bert.eval()
+
+        self.kl_loss = nn.KLDivLoss(reduce="batchmean")
+        self.log_softmax = nn.LogSoftmax(dim = 1)
+        print("setting require grad to false for original bert")
+        for p in self.original_bert.parameters():
+            p.requires_grad = False
+
+        self.init_weights()
+        self.tie_weights()
+
+    def tie_weights(self):
+        """ Make sure we are sharing the input and output embeddings.
+            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
+        """
+        self._tie_or_clone_weights(self.cls.predictions.decoder,
+                                   self.bert.embeddings.word_embeddings)
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
+                masked_lm_labels=None, negated=True):
+
+        loss_dict = {'mlm': 0.0, 'neg': 0.0, 'kl':torch.Tensor([0])}
+
+        kl_loss_value = 0
+        ul_loss_value = 0
+        ll_loss_value = 0
+
+
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask)
+
+        sequence_output = outputs[0]
+        prediction_scores = self.cls(sequence_output)
+
+        outputs = (prediction_scores,) + outputs[2:]  # Add hidden states and attention if they are here
+        if not negated:
+            if masked_lm_labels is not None:
+                original_probs_mask = torch.ne(masked_lm_labels, -1).float()
+                lm_labels_mask = torch.ne(masked_lm_labels, -1) #too many masks
+                true_ids = masked_lm_labels[lm_labels_mask] #shoud be bs?
+
+                with torch.no_grad():
+                    original_scores = self.original_bert(input_ids,     #bs,l,vocab_size
+                                                         attention_mask=attention_mask,
+                                                         token_type_ids=token_type_ids,
+                                                         position_ids=position_ids,
+                                                         head_mask=head_mask)[0]
+                    original_scores.detach() #bs x ln x vocab
+                    orig_masked_probs = original_scores[lm_labels_mask]
+
+
+                    orig_masked_probs = self.original_model_softmax(orig_masked_probs) #bs , vs
+                    dummy_loss = original_scores.sum() * 0.
+
+                new_masked_probs = prediction_scores[lm_labels_mask] #bs, vocab_size
+                new_masked_probs = self.log_softmax(new_masked_probs) #bs, vs
+                masked_lm_loss = self.kl_loss(new_masked_probs, orig_masked_probs) * 100.
+                loss_dict['mlm'] = masked_lm_loss
+                outputs = (masked_lm_loss,) + outputs
+
+
+        else:
+            original_probs_mask = torch.ne(masked_lm_labels, -1).float()
+            lm_labels_mask = torch.ne(masked_lm_labels, -1) #too many masks
+            true_ids = masked_lm_labels[lm_labels_mask] #shoud be bs?
+
+            with torch.no_grad():
+                original_scores = self.original_bert(input_ids,     #bs,l,vocab_size
+                                                     attention_mask=attention_mask,
+                                                     token_type_ids=token_type_ids,
+                                                     position_ids=position_ids,
+                                                     head_mask=head_mask)[0]
+
+                original_scores.detach() #bs x ln x vocab
+                orig_masked_probs = original_scores[lm_labels_mask]
+
+                orig_masked_probs.scatter_(1, true_ids.unsqueeze(1) ,-100) #put -100 in the gold ids probability
+                # orig_masked_probs.scatter_(1, true_ids.unsqueeze(1) ,orig_masked_probs.mean(1).unsqueeze(1)) #put -100 in the gold ids probability
+                orig_masked_probs = self.original_model_softmax(orig_masked_probs) #bs , vs
+                dummy_loss = original_scores.sum() * 0.
+
+            new_masked_probs = prediction_scores[lm_labels_mask] #bs, vocab_size
+
+            new_masked_probs = self.log_softmax(new_masked_probs) #bs, vs
+            kl_consistency_loss = self.kl_loss(new_masked_probs, orig_masked_probs) * 100.
+            # kl_consistency_loss = (orig_masked_probs * (torch.log(orig_masked_probs + 1e-6) - torch.log(new_masked_probs + 1e-6))).sum(1).mean() * 100
+
+            # loss_dict['kl'] = kl_consistency_loss
+            masked_lm_loss = kl_consistency_loss
+            loss_dict['neg'] = masked_lm_loss
+
+            if masked_lm_labels is not None:
+                outputs = (masked_lm_loss,) + outputs
+        return (loss_dict, ) + outputs
+
+
+
 class BertForNegKLPreTraining(BertPreTrainedModel):
     r"""
         **masked_lm_labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size, sequence_length)``:
@@ -943,10 +1254,12 @@ class BertForNegKLPreTraining(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.cls = BertOnlyMLMHead(config)
         self.softmax = nn.Softmax(dim=2)
-
         self.original_model_softmax = nn.Softmax(dim=1)
         self.original_bert = BertForMaskedLM.from_pretrained('bert-base-cased')
         self.original_bert.eval()
+
+        self.kl_loss = nn.KLDivLoss()
+        self.log_softmax = nn.LogSoftmax(dim = 1)
         print("setting require grad to false for original bert")
         for p in self.original_bert.parameters():
             p.requires_grad = False
@@ -964,6 +1277,7 @@ class BertForNegKLPreTraining(BertPreTrainedModel):
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
                 masked_lm_labels=None, negated=True):
 
+        loss_dict = {'mlm': 0.0, 'neg': 0.0, 'kl':torch.Tensor([0])}
 
         kl_loss_value = 0
         ul_loss_value = 0
@@ -984,14 +1298,16 @@ class BertForNegKLPreTraining(BertPreTrainedModel):
             if masked_lm_labels is not None:
                 loss_fct = CrossEntropyLoss(ignore_index=-1)
                 masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
-                ll_loss_value = masked_lm_loss.item()
-                outputs = (masked_lm_loss,ul_loss_value, ll_loss_value, kl_loss_value,) + outputs
+                # ll_loss_value = masked_lm_loss.item()
+                loss_dict['mlm'] = masked_lm_loss
+                outputs = (masked_lm_loss,) + outputs
 
 
         else:
             original_probs_mask = torch.ne(masked_lm_labels, -1).float()
             lm_labels_mask = torch.ne(masked_lm_labels, -1) #too many masks
-            true_ids = masked_lm_labels[lm_labels_mask]
+            true_ids = masked_lm_labels[lm_labels_mask] #shoud be bs?
+
             with torch.no_grad():
                 original_scores = self.original_bert(input_ids,     #bs,l,vocab_size
                                                      attention_mask=attention_mask,
@@ -999,9 +1315,13 @@ class BertForNegKLPreTraining(BertPreTrainedModel):
                                                      position_ids=position_ids,
                                                      head_mask=head_mask)[0]
                 # print(original_scores.shape)
-                original_scores.detach()
-                orig_masked_probs = (original_scores * original_probs_mask.unsqueeze(2)).sum(1) #bs, vocab_size
-                # print("\n\n\n")
+                original_scores.detach() #bs x ln x vocab
+                # orig_masked_probs = (original_scores * original_probs_mask.unsqueeze(2)).sum(1) #bs, vocab_size
+
+                orig_masked_probs = original_scores[lm_labels_mask]
+                # print("orig_masked_probs:", orig_masked_probs.size())
+
+
                 # print(true_ids.shape) #should be equal to num of masks
                 orig_masked_probs.scatter_(1, true_ids.unsqueeze(1) ,-100) #put -100 in the gold ids probability
 
@@ -1009,11 +1329,15 @@ class BertForNegKLPreTraining(BertPreTrainedModel):
                 dummy_loss = original_scores.sum() * 0.
 
 
-            new_masked_probs = (prediction_scores * original_probs_mask.unsqueeze(2)).sum(1) #bs, vocab_size
+            # new_masked_probs = (prediction_scores * original_probs_mask.unsqueeze(2)).sum(1)
+            new_masked_probs = prediction_scores[lm_labels_mask] #bs, vocab_size
             new_masked_probs.scatter_(1, true_ids.unsqueeze(1) ,-100) #put -100 in the gold ids probability
-            new_masked_probs = self.original_model_softmax(new_masked_probs) #bs, vs
-            kl_consistency_loss = (orig_masked_probs * (torch.log(orig_masked_probs + 1e-6) - torch.log(new_masked_probs + 1e-6))).sum(1).mean() * 100
-            kl_loss_value = kl_consistency_loss.item()
+            new_masked_probs = self.log_softmax(new_masked_probs) #bs, vs
+            kl_consistency_loss = self.kl_loss(new_masked_probs, orig_masked_probs)
+            # kl_consistency_loss = (orig_masked_probs * (torch.log(orig_masked_probs + 1e-6) - torch.log(new_masked_probs + 1e-6))).sum(1).mean() * 100
+            # kl_loss_value = kl_consistency_loss.item()
+            loss_dict['kl'] = kl_consistency_loss
+
             # print("kl loss: ", kl_consistency_loss)
 
             prediction_probs = self.softmax(prediction_scores)
@@ -1024,21 +1348,74 @@ class BertForNegKLPreTraining(BertPreTrainedModel):
             # print("probs: ", prediction_probs.shape)
             # print(masked_lm_labels[0,:])
             masked_lm_loss = - prediction_probs.sum()
-            ul_loss_value = masked_lm_loss.item()
+            # ul_loss_value = masked_lm_loss.item()
+            loss_dict['neg'] = masked_lm_loss
 
-            masked_lm_loss += kl_consistency_loss
+            # masked_lm_loss += kl_consistency_loss
             # print("LOSS: ", masked_lm_loss)
             # prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)] = 1. - prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)]
             # prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)] = 1. - prediction_scores.view(-1, prediction_scores.shape[2])[torch.arange(masked_lm_labels.shape[0]*masked_lm_labels.shape[1]),masked_lm_labels.view(-1)]
             # prediction_scores[torch.arange(prediction_scores.shape[0]),torch.arange(prediction_scores.shape[1]), masked_lm_labels] = 1. - prediction_scores[torch.arange(prediction_scores.shape[0]), masked_lm_labels]
             # outputs = (prediction_scores,) + outputs[2:]  # Add hidden states and attention if they are here
             if masked_lm_labels is not None:
+                outputs = (masked_lm_loss,) + outputs
                 # loss_fct = CrossEntropyLoss(ignore_index=-1)
                 # masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
                 # print((ul_loss_value, ll_loss_value, kl_loss_value))
-                outputs = (masked_lm_loss,ul_loss_value, ll_loss_value, kl_loss_value,) + outputs
+                # outputs = (masked_lm_loss,ul_loss_value, ll_loss_value, kl_loss_value,) + outputs
+        return (loss_dict, ) + outputs
+        # return outputs  # (masked_lm_loss), prediction_scores, (hidden_states), (attentions)
 
-        return outputs  # (masked_lm_loss), prediction_scores, (hidden_states), (attentions)
+class BertForNegKLNoTiePreTraining(BertForNegKLPreTraining):
+    r"""
+        **masked_lm_labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size, sequence_length)``:
+            Labels for computing the masked language modeling loss.
+            Indices should be in ``[-1, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring)
+            Tokens with indices set to ``-1`` are ignored (masked), the loss is only computed for the tokens with labels
+            in ``[0, ..., config.vocab_size]``
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **loss**: (`optional`, returned when ``masked_lm_labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Masked language modeling loss.
+        **prediction_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length, config.vocab_size)``
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForMaskedLM.from_pretrained('bert-base-uncased')
+        input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute")).unsqueeze(0)  # Batch size 1
+        outputs = model(input_ids, masked_lm_labels=input_ids)
+        loss, prediction_scores = outputs[:2]
+
+    """
+    def __init__(self, config):
+        super(BertForNegKLNoTiePreTraining, self).__init__(config)
+
+        self.init_weights()
+        self.cls.predictions.decoder.weight = nn.Parameter(self.bert.embeddings.word_embeddings.weight.clone())
+        if hasattr(self.cls.predictions.decoder, 'bias') and self.cls.predictions.decoder.bias is not None:
+            self.cls.predictions.decoder.bias.data = torch.nn.functional.pad(
+                self.cls.predictions.decoder.bias.data,
+                (0, self.cls.predictions.decoder.weight.shape[0] - self.cls.predictions.decoder.bias.shape[0]),
+                'constant',
+                0
+            )
+        # self.tie_weights()
+
+    def tie_weights(self):
+        """ Make sure we are sharing the input and output embeddings.
+            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
+        """
+        self._tie_or_clone_weights(self.cls.predictions.decoder,
+                                   self.bert.embeddings.word_embeddings)
 
 
 @add_start_docstrings("""Bert Model with a `language modeling` head on top. """,
@@ -1091,7 +1468,7 @@ class BertForNegPreTraining(BertPreTrainedModel):
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None,
                 masked_lm_labels=None, negated=True):
-        loss_dict = {'mlm': 0, 'neg': 0}
+        loss_dict = {'mlm': 0, 'neg': 0, 'kl': torch.Tensor([0])}
         outputs = self.bert(input_ids,
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids,
@@ -1107,7 +1484,7 @@ class BertForNegPreTraining(BertPreTrainedModel):
                 loss_fct = CrossEntropyLoss(ignore_index=-1)
                 masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
                 outputs = (masked_lm_loss,) + outputs
-                loss_dict['mlm']= masked_lm_loss
+                loss_dict['mlm'] = masked_lm_loss
 
 
         else:
