@@ -9,21 +9,26 @@ import random
 import numpy as np
 from collections import namedtuple
 from tempfile import TemporaryDirectory
+import pickle
 
 from torch.utils.data import DataLoader, Dataset, RandomSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from transformers import WEIGHTS_NAME, CONFIG_NAME
-from transformers.modeling_bert import BertForPreTraining, BertConfig, BertForNegPreTraining, BertForNegKLPreTraining, BertForNegKLDoublePreTraining, BertForNegKLNoTiePreTraining, BertForNegDistillation
+from transformers.modeling_bert import BertForPreTraining, BertConfig, BertForNegPreTraining, BertForNegSameBatch
 from transformers.modeling_roberta import RobertaForNegPreTraining, RobertaConfig
 from transformers.tokenization_bert import BertTokenizer
 from transformers.tokenization_roberta import RobertaTokenizer
 from transformers.optimization import AdamW, WarmupLinearSchedule
 from transformers.log_utils import AverageMeter
 import dist_comms
+from validation import validate
+
+
 
 
 InputFeatures = namedtuple("InputFeatures", "input_ids input_mask segment_ids lm_label_ids")
@@ -39,7 +44,6 @@ def select_field(features, field):
         ]
         for feature in features
     ]
-
 
 
 def convert_example_to_features(example, tokenizer, max_seq_length):
@@ -75,19 +79,6 @@ def fix_bn(m):
     classname = m.__class__.__name__
     if classname.find('BertLayerNorm') != -1:
         m.eval().half()
-
-class FuckWrapper(nn.Module):
-    def __init__(self, config, args):
-        super().__init__()
-        model = BertForNegPreTraining.from_pretrained('bert-base-cased')
-        model = model.to(device)
-
-        self.core = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-        # self.core = nn.DataParallel(BertForNegPreTraining.from_pretrained('bert-base-cased'))
-    def forward(self, **input):
-        return self.core(**input)
-    def save_pretrained(self, output_dir):
-        self.core.module.save_pretrained(output_dir)
 
 class PregeneratedDataset(Dataset):
     def __init__(self, training_path, epoch, tokenizer, num_data_epochs, reduce_memory=False):
@@ -158,15 +149,14 @@ def main():
     parser = ArgumentParser()
     parser.add_argument('--pregenerated_neg_data', type=Path, required=True)
     parser.add_argument('--pregenerated_pos_data', type=Path, required=True)
-    parser.add_argument('--pregenerated_genericskb_neg', type=Path, required=False)
-    parser.add_argument('--pregenerated_genericskb_pos', type=Path, required=False)
+    parser.add_argument('--validation_neg_data', type=Path, required=True)
+    parser.add_argument('--validation_pos_data', type=Path, required=True)
     parser.add_argument('--pregenerated_data', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
+    parser.add_argument('--exp_group', type=str, required=True)
     parser.add_argument("--bert_model", type=str, required=True, help="Bert pre-trained model selected in the list: bert-base-uncased, "
                              "bert-large-uncased, bert-base-cased, bert-base-multilingual, bert-base-chinese.")
-    parser.add_argument("--do_kl", action="store_true")
-    parser.add_argument("--do_distill", action="store_true")
-    parser.add_argument("--do_ll_kl", action="store_true")
+    parser.add_argument("--method", type=str, choices=['neg_samebatch', 'distill_samebatch', 'distill_samebatch_lstm', 'distill', 'kl', 'unlikelihood'])
     parser.add_argument("--do_lower_case", action="store_true")
     parser.add_argument("--save_before", action='store_true')
     parser.add_argument("--reduce_memory", action="store_true",
@@ -195,22 +185,25 @@ def main():
                         default=32,
                         type=int,
                         help="Total batch size for training.")
-    parser.add_argument("--kr_batch_size",
-                        default=8,
+    parser.add_argument("--valid_batch_size",
+                        default=64,
                         type=int,
                         help="Total batch size for training.")
     parser.add_argument("--kr_freq",
-                        default=0.98,
+                        default=0.0,
                         type=float)
     parser.add_argument("--mlm_freq",
                         default=0,
                         type=float)
-    parser.add_argument("--gkb_freq",
-                        default=0.9,
-                        type=float)
     parser.add_argument("--kl_w",
                         default=1000,
                         type=float)
+    parser.add_argument("--ul_w",
+                        default=1,
+                        type=float)
+    parser.add_argument("--gamma",
+                        default=0.5,
+                        type=float, help="coeff of UL and 1-coeff of LL")
     parser.add_argument('--no_mlm',
                         action='store_true',
                         help="don't do any MLM training")
@@ -226,9 +219,6 @@ def main():
     parser.add_argument('--fp16',
                         action='store_true',
                         help="Whether to use 16-bit float precision instead of 32-bit")
-    parser.add_argument('--notonly',
-                        action='store_true',
-                        help="")
     parser.add_argument('--fp16_opt_level', type=str, default='O1',
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
@@ -264,16 +254,6 @@ def main():
 
     assert args.pregenerated_data.is_dir(), \
         "--pregenerated_data should point to the folder of files made by pregenerate_training_data.py!"
-
-    if args.pregenerated_genericskb_neg is not None:
-        assert args.pregenerated_genericskb_neg.is_dir(), \
-            "--pregenerated_genericskb_neg should point to the folder of files"
-    if args.pregenerated_genericskb_pos is not None:
-        assert args.pregenerated_genericskb_pos.is_dir(), \
-            "--pregenerated_genericskb_pos should point to the folder of files"
-
-
-
 
 
     samples_per_epoch = []
@@ -349,40 +329,24 @@ def main():
 
     # Prepare model
     if args.bert_model != "roberta-base":
-        if not args.do_kl:
-            if not args.do_distill:
-                config = BertConfig.from_pretrained(args.bert_model)
-                core_model = BertForNegPreTraining.from_pretrained('bert-base-cased')
-            else:
-                config = BertConfig.from_pretrained(args.bert_model)
-                core_model = BertForNegDistillation.from_pretrained('bert-base-cased')
-
-        elif not args.do_ll_kl:
-            if not args.no_tie:
-                config = BertConfig.from_pretrained(args.bert_model)
-                core_model = BertForNegKLPreTraining.from_pretrained('bert-base-cased')
-            else:
-                config = BertConfig.from_pretrained(args.bert_model)
-                core_model = BertForNegKLNoTiePreTraining.from_pretrained('bert-base-cased')
-
-        elif args.do_kl and args.do_ll_kl:
+        if args.method == "neg_samebatch":
             config = BertConfig.from_pretrained(args.bert_model)
-            core_model = BertForNegKLDoublePreTraining.from_pretrained('bert-base-cased')
+            config.bert_model = args.bert_model
+            core_model = BertForNegSameBatch.from_pretrained(args.bert_model, args.gamma, config=config)
+            core_model.init_orig_bert()
+        elif args.method == "unlikelihood":
+            config = BertConfig.from_pretrained(args.bert_model)
+            core_model = BertForNegPreTraining.from_pretrained(args.bert_model, config=config)
+        else:
+            raise NotImplementedError(f"method {args.method} is not implemented")
     else:
         config = RobertaConfig.from_pretrained(args.bert_model)
         core_model = RobertaForNegPreTraining.from_pretrained(args.bert_model)
 
-    # core_model = BertForNegPreTraining.from_pretrained('bert-base-cased')
-    # core_model = BertForNegKLPreTraining.from_pretrained('bert-base-cased')
     core_model = core_model.to(device)
 
     # Prepare optimizer
-    if args.notonly:
-        not_token_id = 1136
-        param_optimizer = list(core_model.bert.embeddings.word_embeddings.named_parameters())
-    else:
-        param_optimizer = list(core_model.named_parameters())
-
+    param_optimizer = list(core_model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
@@ -416,7 +380,8 @@ def main():
             model.module.save_pretrained(os.path.join(args.output_dir,"before_training"))
             tokenizer.save_pretrained(os.path.join(args.output_dir, "before_training"))
 
-        writer = SummaryWriter(log_dir=args.output_dir)
+        # writer = SummaryWriter(log_dir=args.output_dir)
+        wandb.init(project="neg_v2", name=str(args.output_dir).split("/")[-1], group=args.exp_group, entity='negation')
         mlm_averagemeter = AverageMeter()
         ul_averagemeter = AverageMeter()
         ll_averagemeter = AverageMeter()
@@ -429,35 +394,32 @@ def main():
     pos_epoch_dataset = PregeneratedDataset(epoch=0, training_path=args.pregenerated_pos_data, tokenizer=tokenizer,
                                         num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
 
-    if args.pregenerated_genericskb_neg is not None:
-        gkb_neg_epoch_dataset = PregeneratedDataset(epoch=0, training_path=args.pregenerated_genericskb_neg, tokenizer=tokenizer,
-                                            num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
-    if args.pregenerated_genericskb_pos is not None:
-        gkb_pos_epoch_dataset = PregeneratedDataset(epoch=0, training_path=args.pregenerated_genericskb_pos, tokenizer=tokenizer,
-                                            num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
 
+    neg_validation_dataset = PregeneratedDataset(epoch=0, training_path=args.validation_neg_data, tokenizer=tokenizer,
+                                        num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
+    pos_validation_dataset = PregeneratedDataset(epoch=0, training_path=args.validation_pos_data, tokenizer=tokenizer,
+                                        num_data_epochs=num_data_epochs, reduce_memory=args.reduce_memory)
 
     if args.local_rank == -1:
         neg_train_sampler = RandomSampler(neg_epoch_dataset)
         pos_train_sampler = RandomSampler(pos_epoch_dataset)
-        if args.pregenerated_genericskb_neg is not None:
-            gkb_neg_train_sampler = RandomSampler(gkb_neg_epoch_dataset)
-        if args.pregenerated_genericskb_pos is not None:
-            gkb_pos_train_sampler = RandomSampler(gkb_pos_epoch_dataset)
+
+        neg_valid_sampler = RandomSampler(neg_validation_dataset)
+        pos_valid_sampler = RandomSampler(pos_validation_dataset)
     else:
         neg_train_sampler = DistributedSampler(neg_epoch_dataset)
         pos_train_sampler = DistributedSampler(pos_epoch_dataset)
-        if args.pregenerated_genericskb_neg is not None:
-            gkb_neg_train_sampler = DistributedSampler(gkb_neg_epoch_dataset)
-        if args.pregenerated_genericskb_pos is not None:
-            gkb_pos_train_sampler = DistributedSampler(gkb_pos_epoch_dataset)
+
+        neg_valid_sampler = DistributedSampler(neg_validation_dataset)
+        pos_valid_sampler = DistributedSampler(pos_validation_dataset)
 
     neg_train_dataloader = DataLoader(neg_epoch_dataset, sampler=neg_train_sampler, batch_size=args.train_batch_size)
     pos_train_dataloader = DataLoader(pos_epoch_dataset, sampler=pos_train_sampler, batch_size=args.train_batch_size)
-    if args.pregenerated_genericskb_neg is not None:
-        gkb_neg_train_dataloader = DataLoader(gkb_neg_epoch_dataset, sampler=gkb_neg_train_sampler, batch_size=args.train_batch_size)
-    if args.pregenerated_genericskb_pos is not None:
-        gkb_pos_train_dataloader = DataLoader(gkb_pos_epoch_dataset, sampler=gkb_pos_train_sampler, batch_size=args.train_batch_size)
+
+    neg_valid_dataloader = DataLoader(neg_validation_dataset, sampler=neg_valid_sampler, batch_size=args.valid_batch_size)
+    pos_valid_dataloader = DataLoader(pos_validation_dataset, sampler=pos_valid_sampler, batch_size=args.valid_batch_size)
+
+
 
     def inf_train_gen():
         while True:
@@ -473,25 +435,9 @@ def main():
 
     pos_kr_gen = pos_inf_train_gen()
 
-    if args.pregenerated_genericskb_neg is not None:
-        def gkb_neg_inf_train_gen():
-            while True:
-                for kr_step, kr_batch in enumerate(gkb_neg_train_dataloader):
-                    yield kr_step, kr_batch
-
-        gkb_neg_gen = gkb_neg_inf_train_gen()
-    if args.pregenerated_genericskb_pos is not None:
-        def gkb_pos_inf_train_gen():
-            while True:
-                for kr_step, kr_batch in enumerate(gkb_pos_train_dataloader):
-                    yield kr_step, kr_batch
-
-        gkb_pos_gen = gkb_pos_inf_train_gen()
-
     mlm_loss, neg_loss = 0,0
     mlm_nb_it, neg_nb_it = 1,1
     mlm_nb_ex, neg_nb_ex = 0,0
-
 
     for epoch in range(args.epochs):
         epoch_dataset = PregeneratedDataset(epoch=epoch, training_path=args.pregenerated_data, tokenizer=tokenizer,
@@ -502,8 +448,6 @@ def main():
             train_sampler = DistributedSampler(epoch_dataset)
 
         train_dataloader = DataLoader(epoch_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
-
-
 
         tr_loss = 0
         nb_tr_examples, nb_tr_steps = 0, 0
@@ -516,7 +460,6 @@ def main():
         nb_kl_tr_examples, nb_kl_tr_steps = 0, 1
 
 
-
         if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
             logging.info("** ** * Saving fine-tuned model ** ** * ")
             model.module.save_pretrained(args.output_dir)
@@ -526,7 +469,6 @@ def main():
             for step, batch in enumerate(train_dataloader):
                 if not args.no_mlm and (random.random() > args.mlm_freq):
                     model.train()
-
                     batch = tuple(t.to(device) for t in batch)
                     input_ids, input_mask, segment_ids, lm_label_ids = batch
 
@@ -540,13 +482,8 @@ def main():
                     loss_dict = outputs[0]
                     mlm_loss += loss_dict['mlm'].item()
 
-
-
                     mlm_nb_it += 1
                     mlm_nb_ex += input_ids.size(0)
-                    # loss_values = outputs[1:4]
-                    # ll_tr_loss += loss_values[1]
-
 
                     if n_gpu > 1:
                         loss = loss.mean() # mean() to average on multi-gpu.
@@ -557,35 +494,23 @@ def main():
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer) as scaled_loss:
                             scaled_loss.backward()
-                            if args.notonly:
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad)
-                                optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] = optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] * 0.
-                                optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1:] = optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1: ] * 0.
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad[not_token_id-1])
-
                         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                     else:
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                     tr_loss += loss.item()
-                    nb_tr_examples += input_ids.size(0)
 
                     if args.local_rank == 0 or args.local_rank == -1:
                         mlm_averagemeter.update(loss_dict['mlm'].item())
-                        writer.add_scalar('MLM/train', loss_dict['mlm'].item(), mlm_nb_it)
+                        # writer.add_scalar('MLM/train', loss_dict['mlm'].item(), mlm_nb_it)
+                        wandb.log({'MLM/train': loss_dict['mlm'].item()})
 
                         nb_tr_steps += 1
                         nb_ll_tr_steps += 1
-                        # pbar.update(1)
                         mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-                        # pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
-                        mlm_mean_loss = mlm_loss / mlm_nb_it
-                        neg_mean_loss = neg_loss / neg_nb_it
 
-
-
-                        pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.4f}, UL: {ul_averagemeter:.4f}, LL: {ll_averagemeter:.4f}, KL: {kl_averagemeter:.4f}")
+                        pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.6f}, UL: {ul_averagemeter:.6f}, LL: {ll_averagemeter:.6f}, KL: {kl_averagemeter:.6f}")
 
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         scheduler.step()  # Update learning rate schedule
@@ -593,9 +518,37 @@ def main():
                         optimizer.zero_grad()
                         global_step += 1
                 pbar.update(1)
+                random_num = random.random()
+                if random_num > args.kr_freq:
+                    if args.method in ["neg_samebatch"]:
+                        ul_step, ul_batch = next(kr_gen)
+                        ul_batch = tuple(t.to(device) for t in ul_batch)
+                        ul_input_ids, ul_input_mask, ul_segment_ids, ul_lm_label_ids = ul_batch
 
-                if random.random() > args.kr_freq:
-                    if random.random() > 0.5 and not args.no_ul:
+                        ll_step, ll_batch = next(pos_kr_gen)
+                        ll_batch = tuple(t.to(device) for t in ll_batch)
+                        ll_input_ids, ll_input_mask, ll_segment_ids, ll_lm_label_ids = ll_batch
+
+                        batch_mask = torch.zeros((ul_input_ids.size(0)+ll_input_ids.size(0)), dtype=ll_input_mask.dtype, device=device)
+                        batch_mask[:ul_input_ids.size(0)] = 1.
+
+                        outputs = model(input_ids=torch.cat([ul_input_ids, ll_input_ids], 0),
+                                        attention_mask=torch.cat([ul_input_mask, ll_input_mask], 0),
+                                        token_type_ids=torch.cat([ul_segment_ids, ll_segment_ids], 0),
+                                        masked_lm_labels=torch.cat([ul_lm_label_ids, ll_lm_label_ids], 0),
+                                        negated=True,
+                                        batch_neg_mask=batch_mask)
+
+                        loss = outputs[1] * args.ul_w
+                        loss_dict = outputs[0]
+
+                        if args.local_rank == 0 or args.local_rank == -1:
+                            wandb.log({'UL/train': loss_dict['neg'].item(), 'LL/train': loss_dict['pos'].item()})
+                            ul_averagemeter.update(loss_dict['neg'].item())
+                            ll_averagemeter.update(loss_dict['pos'].item())
+                        neg_nb_it += 1
+
+                    elif random.random() > 0.5 and not args.no_ul:
                         kr_step, kr_batch = next(kr_gen)
                         kr_batch = tuple(t.to(device) for t in kr_batch)
                         input_ids, input_mask, segment_ids, lm_label_ids = kr_batch
@@ -605,23 +558,19 @@ def main():
                                         token_type_ids=segment_ids,
                                         masked_lm_labels=lm_label_ids,
                                         negated=True)
-                        loss = outputs[1]
-                        if args.do_kl:
-                            loss += outputs[0]['kl'] * args.kl_w
+
+                        loss = outputs[1] * args.ul_w
 
                         loss_dict = outputs[0]
                         nb_ul_tr_steps += 1
 
                         neg_loss += loss_dict['neg'].item()
                         if args.local_rank == 0 or args.local_rank == -1:
-                            writer.add_scalar('UL/train', loss_dict['neg'].item(), neg_nb_it)
-                            writer.add_scalar('KL/train', loss_dict['kl'].item() * args.kl_w, neg_nb_it)
+                            wandb.log({'UL/train': loss_dict['neg'].item(), 'KL/train': loss_dict['kl'].item() * args.kl_w})
                             ul_averagemeter.update(loss_dict['neg'].item())
                             kl_averagemeter.update(loss_dict['kl'].item() * args.kl_w)
 
-
                         neg_nb_it += 1
-                        neg_nb_ex += input_ids.size(0)
                     elif not args.no_ll:
                         kr_step, kr_batch = next(pos_kr_gen)
                         kr_batch = tuple(t.to(device) for t in kr_batch)
@@ -633,8 +582,6 @@ def main():
                                         masked_lm_labels=lm_label_ids,
                                         negated=False)
                         loss = outputs[1]
-                        if args.do_ll_kl:
-                            loss += outputs[0]['kl'] * args.kl_w
                         loss_dict = outputs[0]
                         nb_ll_tr_steps += 1
 
@@ -642,9 +589,8 @@ def main():
 
                         mlm_nb_it += 1
                         if args.local_rank == 0 or args.local_rank == -1:
-                            writer.add_scalar('LL/train', loss_dict['mlm'].item(), mlm_nb_it)
+                            wandb.log({'LL/train': loss_dict['mlm'].item()})
                             ll_averagemeter.update(loss_dict['mlm'].item())
-
 
                         mlm_nb_ex += input_ids.size(0)
                     else:
@@ -658,100 +604,35 @@ def main():
                     if args.fp16:
                         with amp.scale_loss(loss, optimizer) as scaled_loss:
                             scaled_loss.backward()
-                            if args.notonly:
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad)
-                                optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] = optimizer_grouped_parameters[0]["params"][0].grad[:not_token_id] * 0.
-                                optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1:] = optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1: ] * 0.
-                                # print(optimizer_grouped_parameters[0]["params"][0].grad[not_token_id+1])
-                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-                    else:
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-                    # loss_values = outputs[1:4]
-                    # ll_tr_loss += loss_values[1]
-                    # ul_tr_loss += loss_values[0]
-                    # kl_tr_loss += loss_values[2]
-
-
-                    tr_loss += loss.item()
-                    nb_tr_examples += input_ids.size(0)
-                    if args.local_rank == 0 or args.local_rank == -1:
-                        nb_tr_steps += 1
-                        mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-
-                        kl_mean_loss = kl_tr_loss / nb_ul_tr_steps
-                        ul_mean_loss = ul_tr_loss / nb_ul_tr_steps
-                        ll_mean_loss = ll_tr_loss / nb_ll_tr_steps
-
-                        mlm_mean_loss = mlm_loss / mlm_nb_it
-                        neg_mean_loss = neg_loss / neg_nb_it
-
-                        # pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.3f}, UL: {ul_averagemeter:.3f}, LL: {ll_averagemeter:.3f}")
-                        pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.4f}, UL: {ul_averagemeter:.4f}, LL: {ll_averagemeter:.4f}, KL: {kl_averagemeter:.4f}")
-                        # pbar.set_postfix_str(f"MLM: {mlm_mean_loss:.3f}, UL: {neg_mean_loss:.3f}")
-                    if (step + 1) % args.gradient_accumulation_steps == 0:
-                        scheduler.step()  # Update learning rate schedule
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        global_step += 1
-                if (args.pregenerated_genericskb_pos is not None and args.pregenerated_genericskb_neg is not None) and random.random() > args.gkb_freq:
-                    if random.random() > 0.5 and not args.no_ul:
-                        kr_step, kr_batch = next(gkb_neg_gen)
-                        kr_batch = tuple(t.to(device) for t in kr_batch)
-                        input_ids, input_mask, segment_ids, lm_label_ids = kr_batch
-
-                        outputs = model(input_ids=input_ids,
-                                        attention_mask=input_mask,
-                                        token_type_ids=segment_ids,
-                                        masked_lm_labels=lm_label_ids,
-                                        negated=True)
-                        loss = outputs[0]
-                    else:
-                        kr_step, kr_batch = next(gkb_pos_gen)
-                        kr_batch = tuple(t.to(device) for t in kr_batch)
-                        input_ids, input_mask, segment_ids, lm_label_ids = kr_batch
-
-                        outputs = model(input_ids=input_ids,
-                                        attention_mask=input_mask,
-                                        token_type_ids=segment_ids,
-                                        masked_lm_labels=lm_label_ids,
-                                        negated=False)
-                        loss = outputs[0]
-
-                    if n_gpu > 1:
-                        loss = loss.mean() # mean() to average on multi-gpu.
-                    if args.gradient_accumulation_steps > 1:
-                        loss = loss / args.gradient_accumulation_steps
-
-                    if args.fp16:
-                        with amp.scale_loss(loss, optimizer) as scaled_loss:
-                            scaled_loss.backward()
                         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                     else:
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
                     tr_loss += loss.item()
-                    nb_tr_examples += input_ids.size(0)
                     if args.local_rank == 0 or args.local_rank == -1:
                         nb_tr_steps += 1
                         mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
-
-                        pbar.set_postfix_str(f"mlm: {mean_loss:.5f}")
+                        pbar.set_postfix_str(f"MLM: {mlm_averagemeter:.6f}, UL: {ul_averagemeter:.6f}, LL: {ll_averagemeter:.6f}, KL: {kl_averagemeter:.6f}")
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         scheduler.step()  # Update learning rate schedule
                         optimizer.step()
                         optimizer.zero_grad()
                         global_step += 1
-
+                if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
+                    if False and (step + 1) % 100 == 0:
+                        neg_valid_res = validate(model=model, dataloader=neg_valid_dataloader, device=device, negated=True)
+                        pos_valid_res = validate(model=model, dataloader=pos_valid_dataloader, device=device, negated=False)
+                        wandb.log({'neg/valid/p@1': neg_valid_res % 100., 'pos/valid/p@1':  pos_valid_res % 100.})
 
     # Save a trained model
     if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
+        print("Saving model")
         logging.info("** ** * Saving fine-tuned model ** ** * ")
         model.module.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
-
+        print(str(wandb.run.id))
+        pickle.dump(str(wandb.run.id),open(os.path.join(args.output_dir, 'wandb_run_id.pkl'), 'wb'))
 
 if __name__ == '__main__':
     main()

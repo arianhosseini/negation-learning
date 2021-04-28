@@ -23,6 +23,8 @@ import logging
 import os
 import random
 from pathlib import Path
+import pickle
+import wandb
 
 import numpy as np
 import torch
@@ -171,7 +173,7 @@ def train(args, train_dataset, model, config, tokenizer):
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
+                        results, _ = evaluate(args, model, tokenizer)
                         for key, value in results.items():
                             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
@@ -229,6 +231,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM', args.output_dir+ 'Neg', args.output_dir + 'Neg-MM') if args.task_name == "mnli" else (args.output_dir,)
 
     results = {}
+    wandb_res={}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
         eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
 
@@ -249,11 +252,6 @@ def evaluate(args, model, tokenizer, prefix=""):
         preds = None
         out_label_ids = None
 
-
-        if eval_task == "mnli-neg" or eval_task == "mnli-neg-mm":
-            output_sentences_eval_file = os.path.join(eval_output_dir, prefix, "sentences_and_labels_{}.txt".format(eval_task))
-            sentence_writer = open(output_sentences_eval_file, "w")
-
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
@@ -264,6 +262,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                           'labels':         batch[3]}
                 if args.model_type != 'distilbert':
                     inputs['token_type_ids'] = batch[2] if args.model_type in ['bert', 'xlnet'] else None  # XLM, DistilBERT and RoBERTa don't use segment_ids
+
                 outputs = model(**inputs)
                 tmp_eval_loss, logits = outputs[:2]
                 eval_loss += tmp_eval_loss.mean().item()
@@ -275,13 +274,6 @@ def evaluate(args, model, tokenizer, prefix=""):
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
 
-            if eval_task == "mnli-neg" or eval_task == "mnli-neg-mm":
-                for idx in range(len(inputs)):
-                    sentence = tokenizer.convert_ids_to_tokens(list(inputs["input_ids"][idx].detach().cpu().numpy())).replace("[PAD]", "").strip()
-                    orig_label = labeldict[inputs["labels"][idx].detach().cpu().numpy()]
-                    predicted_label = labeldict[logits.detach().cpu().numpy()[idx].argmax()]
-                    if orig_label != predicted_label:
-                        sentence_writer.write("{}\t{}\t{}\n".format(sentence, orig_label, predicted_label))
 
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
@@ -290,18 +282,14 @@ def evaluate(args, model, tokenizer, prefix=""):
             preds = np.squeeze(preds)
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
-
+        wandb_res[eval_task] = result['acc']
         output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
-
-
-
-
-    return results
+    return results, wandb_res
 
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
@@ -477,7 +465,7 @@ def main():
         args.n_gpu = torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda:0", args.local_rank)
+        device = torch.device("cuda", args.local_rank)
         torch.distributed.init_process_group(backend='nccl')
         args.n_gpu = 1
     args.device = device
@@ -524,12 +512,11 @@ def main():
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    print("this:")
-    print (model_class)
 
+    print("Model Clas: ", model_class)
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name, architectures = ['BertForSequenceClassification'])
     config.architectures = ['BertForSequenceClassification']
-    print(config_class)
+    print("Config Class: ", config_class)
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
     model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
 
@@ -542,6 +529,13 @@ def main():
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir)
+
+    if args.local_rank in [-1, 0]:
+        wandb_run_id_path = Path(args.model_name_or_path)/Path('wandb_run_id.pkl')
+        wandb_run_id = pickle.load(open(wandb_run_id_path, 'rb')) if wandb_run_id_path.exists() else Path(args.model_name_or_path).name
+        print("wandbid: ", wandb_run_id)
+        wandb.init(project="negation", entity='negation', id=wandb_run_id, resume=True)
+        wandb_table = wandb.Table(columns=["split", "Acc"])
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
@@ -566,8 +560,7 @@ def main():
         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 
         # Load a trained model and vocabulary that you have fine-tuned
-        print("model class once again")
-        print(model_class)
+        print("model class: ",model_class)
         model = model_class.from_pretrained(args.output_dir)
         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         model.to(args.device)
@@ -585,13 +578,16 @@ def main():
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split('/')[-1] if checkpoint.find('checkpoint') != -1 else ""
-
-            model = model_class.from_pretrained(checkpoint)
+            model = model_class.from_pretrained(checkpoint, config=config)
             model.to(args.device)
-            result = evaluate(args, model, tokenizer, prefix=prefix)
+            result, wandb_res = evaluate(args, model, tokenizer, prefix=prefix)
+            print("wandb res: ", wandb_res)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
 
+        for k,v in wandb_res.items():
+            wandb_table.add_data(k, v)
+        wandb.log({args.task_name : wandb.plot.bar(wandb_table, "split", "Acc", title=args.task_name)})
     return results
 
 

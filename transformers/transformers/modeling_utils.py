@@ -375,9 +375,8 @@ class PreTrainedModel(nn.Module):
                     new_key = key.replace('gamma', 'weight')
                 if 'beta' in key:
                     new_key = key.replace('beta', 'bias')
-                if 'classifier' in key and (str(cls)!= "<class 'transformers.modeling_bert.BertForSequenceClassification'>" and str(cls)!= "<class 'transformers.modeling_bert.BertForNegSequenceClassification'>"):
-                    print(str(cls))
-                    print("\n\nimmo remove bro\n\n\n\n")
+                if 'classifier' in key and (str(cls) not in ["<class 'transformers.modeling_bert.BertForSequenceClassification'>", "<class 'transformers.modeling_bert.BertForNegSequenceClassification'>", "<class 'transformers.modeling_bert.BertForSequenceClassificationWithUL'>"]):
+                    print("\n\n removing \n\n\n")
                     remove_keys.append(key)
                 if new_key:
                     old_keys.append(key)
