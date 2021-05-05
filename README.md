@@ -1,7 +1,7 @@
 
 # Negation-Learning
 
-# train BERETNOT
+# train BERTNOT
 
 ```
 python -m torch.distributed.launch --nproc_per_node=1 \ examples/lm_training/finetune_on_pregenerated_negation_distributed.py\
