@@ -24,3 +24,5 @@ python -m torch.distributed.launch --nproc_per_node=1 \ examples/lm_training/fin
     --seed $seed \
     --method neg_samebatch
 ```
+
+Data can be downloaded from [here](https://zenodo.org/record/4737796).
