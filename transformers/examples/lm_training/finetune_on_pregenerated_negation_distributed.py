@@ -26,7 +26,6 @@ from transformers.tokenization_roberta import RobertaTokenizer
 from transformers.optimization import AdamW, WarmupLinearSchedule
 from transformers.log_utils import AverageMeter
 import dist_comms
-from validation import validate
 
 
 
@@ -620,10 +619,7 @@ def main():
                         optimizer.zero_grad()
                         global_step += 1
                 if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
-                    if False and (step + 1) % 100 == 0:
-                        neg_valid_res = validate(model=model, dataloader=neg_valid_dataloader, device=device, negated=True)
-                        pos_valid_res = validate(model=model, dataloader=pos_valid_dataloader, device=device, negated=False)
-                        wandb.log({'neg/valid/p@1': neg_valid_res % 100., 'pos/valid/p@1':  pos_valid_res % 100.})
+                    pass
 
     # Save a trained model
     if  n_gpu > 1 and args.local_rank == -1  or (n_gpu <=1 and args.local_rank == 0):
